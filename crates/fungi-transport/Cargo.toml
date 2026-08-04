@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 futures-util = "0.3"

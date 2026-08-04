@@ -7,10 +7,12 @@
 //! The API is [`Channel`] (send/recv one connected peer), [`Connector`]
 //! (open new channels) and [`Listener`] (accept inbound ones), plus
 //! [`into_stream`] to adapt a `Channel` into a `Stream` where that's more
-//! convenient.
+//! convenient. [`testkit`] holds the transport-agnostic conformance suite
+//! every `Channel` implementation is expected to pass.
 
 pub mod channel;
 pub mod error;
+pub mod testkit;
 
 pub use channel::{Channel, Connector, Listener, into_stream};
 pub use error::{BoxError, ConnectError, RecvError, SendError};
