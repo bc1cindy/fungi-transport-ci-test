@@ -3,7 +3,14 @@
 //! A channel is a connection to ONE peer moving opaque byte messages, one
 //! message per call. No delivery ordering across channels, no deduplication,
 //! no framing, no anonymity semantics — those belong to other layers.
+//!
+//! The API is [`Channel`] (send/recv one connected peer), [`Connector`]
+//! (open new channels) and [`Listener`] (accept inbound ones), plus
+//! [`into_stream`] to adapt a `Channel` into a `Stream` where that's more
+//! convenient.
 
+pub mod channel;
 pub mod error;
 
-pub use error::{BoxError, RecvError, SendError};
+pub use channel::{Channel, Connector, Listener, into_stream};
+pub use error::{BoxError, ConnectError, RecvError, SendError};
