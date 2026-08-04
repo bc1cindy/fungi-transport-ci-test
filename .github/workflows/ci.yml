@@ -16,3 +16,4 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo test --doc
+      - run: cargo run -p fungi-transport --example echo

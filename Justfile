@@ -17,3 +17,4 @@ check:
     cargo clippy --all-targets -- -D warnings
     cargo test --all-targets
     cargo test --doc
+    cargo run -p fungi-transport --example echo
