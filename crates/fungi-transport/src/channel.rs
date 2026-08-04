@@ -29,6 +29,28 @@ use crate::error::{ConnectError, RecvError, SendError};
 /// - Messages have arbitrary size; a transport rejects oversized ones with
 ///   [`SendError::TooLarge`].
 /// - No ordering guarantees — within or across channels, no deduplication.
+///
+/// # Examples
+///
+/// A connected pair exchanging messages in both directions, using the
+/// in-memory implementation ([`crate::mem`]) that any real transport
+/// (SOCKS5h, arti, an OHTTP mailbox) must behave like:
+///
+/// ```
+/// use fungi_transport::Channel;
+/// use fungi_transport::mem::{MemConfig, duplex};
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let (mut a, mut b) = duplex(MemConfig::default());
+///
+/// a.send(b"hello").await.unwrap();
+/// assert_eq!(b.recv().await.unwrap(), b"hello");
+///
+/// b.send(b"world").await.unwrap();
+/// assert_eq!(a.recv().await.unwrap(), b"world");
+/// # }
+/// ```
 pub trait Channel: Send {
     /// Send one opaque message to the peer.
     fn send(&mut self, msg: &[u8]) -> impl Future<Output = Result<(), SendError>> + Send;
