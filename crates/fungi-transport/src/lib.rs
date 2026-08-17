@@ -14,6 +14,7 @@
 
 pub mod channel;
 pub mod error;
+pub mod framed;
 pub mod mem;
 pub mod testkit;
 
