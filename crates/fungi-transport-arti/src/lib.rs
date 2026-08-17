@@ -7,7 +7,9 @@
 
 mod connector;
 mod error;
+mod listener;
 mod transport;
 
 pub use connector::ArtiConnector;
+pub use listener::ArtiListener;
 pub use transport::{ArtiConfig, ArtiTransport};

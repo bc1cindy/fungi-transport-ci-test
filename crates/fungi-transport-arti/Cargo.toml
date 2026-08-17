@@ -24,6 +24,11 @@ tor-rtcompat = { version = "=0.45.0", default-features = false, features = [
     "tokio",
 ] }
 tor-proto = "=0.45.0"
+# `HsId` (the onion-service address type) only implements
+# `safelog::DisplayRedacted`, not plain `Display` — this crate needs the
+# unredacted form to hand real addresses to peers out of band. Pinned to the
+# version already in Cargo.lock via arti-client's own dependency tree.
+safelog = "=0.9.1"
 futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["sync", "time"] }
 
