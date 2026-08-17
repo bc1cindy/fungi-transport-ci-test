@@ -5,7 +5,9 @@
 //! onion service and opens streams to peer `.onion` addresses. Message
 //! delimitation is the same [`fungi_transport::framed`] length-prefix layer.
 
+mod connector;
 mod error;
 mod transport;
 
+pub use connector::ArtiConnector;
 pub use transport::{ArtiConfig, ArtiTransport};

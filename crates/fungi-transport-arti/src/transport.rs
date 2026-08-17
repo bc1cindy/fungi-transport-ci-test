@@ -85,6 +85,14 @@ impl ArtiTransport {
             max_msg_len,
         }
     }
+
+    /// The connector half, sharing this transport's client.
+    pub fn connector(&self) -> crate::ArtiConnector {
+        crate::ArtiConnector {
+            client: self.client.clone(),
+            max_msg_len: self.max_msg_len,
+        }
+    }
 }
 
 #[cfg(test)]
