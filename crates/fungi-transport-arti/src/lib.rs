@@ -4,3 +4,5 @@
 //! with Tor running inside the process via `arti-client`: each peer runs an
 //! onion service and opens streams to peer `.onion` addresses. Message
 //! delimitation is the same [`fungi_transport::framed`] length-prefix layer.
+
+mod error;
