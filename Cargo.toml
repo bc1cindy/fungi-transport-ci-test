@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/fungi-transport",
     "crates/fungi-transport-socks5h",
+    "crates/fungi-transport-arti",
 ]
 
 [workspace.package]
