@@ -1331,7 +1331,6 @@ dependencies = [
  "arti-client",
  "fungi-transport",
  "futures-util",
- "ring",
  "rustls",
  "safelog",
  "tokio",

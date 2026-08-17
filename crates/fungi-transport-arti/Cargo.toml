@@ -12,6 +12,7 @@ arti-client = { version = "=0.45.0", default-features = false, features = [
     "rustls",
     "onion-service-client",
     "onion-service-service",
+    # experimental-api NOT required for onion-service-client/-service on 0.45.0 (verified Task 1)
 ] }
 # Pinned to match arti-client's own dependency tree (verified via
 # `cargo tree -p fungi-transport-arti | grep -E "tor-hsservice|tor-cell"`).
@@ -30,12 +31,10 @@ tor-proto = "=0.45.0"
 # version already in Cargo.lock via arti-client's own dependency tree.
 safelog = "=0.9.1"
 futures-util = { version = "0.3", default-features = false }
-tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 rustls = { version = "0.23", features = ["ring"] }
-ring = "0.17"
 
 [lints]
 workspace = true

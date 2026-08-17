@@ -50,7 +50,6 @@ pub(crate) fn tor_config(cfg: &ArtiConfig) -> Result<TorClientConfig, ConnectErr
 
 /// A bootstrapped in-process Tor client, source of both channel halves.
 pub struct ArtiTransport {
-    #[allow(dead_code)]
     pub(crate) client: Arc<TorClient<PreferredRuntime>>,
     pub(crate) max_msg_len: usize,
 }
@@ -66,6 +65,16 @@ impl std::fmt::Debug for ArtiTransport {
 impl ArtiTransport {
     /// Bootstrap onto the Tor network. Expensive (seconds); do it once per
     /// peer and share the result.
+    ///
+    /// Requires a rustls `CryptoProvider` to be installed as the process
+    /// default. rustls normally auto-installs one the first time it's
+    /// needed, but auto-install only works when exactly one crypto-provider
+    /// feature (`ring` or `aws-lc-rs`) is enabled across the dependency
+    /// graph. If a consumer's other dependencies pull in both, rustls
+    /// cannot pick one and this function panics with "CryptoProvider not
+    /// installed". The fix is to install one explicitly before calling
+    /// `bootstrap`, e.g. `rustls::crypto::ring::default_provider().install_default()`
+    /// (or the `aws_lc_rs` equivalent).
     pub async fn bootstrap(cfg: ArtiConfig) -> Result<Self, ConnectError> {
         let tor_cfg = tor_config(&cfg)?;
         let client = TorClient::create_bootstrapped(tor_cfg)
