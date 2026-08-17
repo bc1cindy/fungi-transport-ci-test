@@ -9,27 +9,23 @@ use arti_client::config::dir;
 use tor_llcrypto::pk::ed25519::Ed25519Identity;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 
-#[allow(dead_code)]
 pub(crate) struct Authority {
     pub(crate) name: String,
     pub(crate) v3ident: String,
 }
 
-#[allow(dead_code)]
 pub(crate) struct Fallback {
     pub(crate) rsa: String,
     pub(crate) ed: String,
     pub(crate) orport: String,
 }
 
-#[allow(dead_code)]
 pub(crate) struct PrivateNet {
     pub(crate) authorities: Vec<Authority>,
     pub(crate) fallbacks: Vec<Fallback>,
 }
 
 impl PrivateNet {
-    #[allow(dead_code)]
     pub(crate) fn parse(text: &str) -> Result<PrivateNet, String> {
         let mut authorities = Vec::new();
         let mut fallbacks = Vec::new();
@@ -71,7 +67,6 @@ impl PrivateNet {
 
     /// Apply onto arti's config builder: custom authorities + fallbacks and
     /// testing-network directory tolerances.
-    #[allow(dead_code)]
     pub(crate) fn apply(&self, b: &mut TorClientConfigBuilder) -> Result<(), String> {
         let mut authorities = dir::AuthorityContacts::builder();
         for a in &self.authorities {

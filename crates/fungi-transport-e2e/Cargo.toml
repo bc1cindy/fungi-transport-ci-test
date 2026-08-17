@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 fungi-transport = { path = "../fungi-transport" }
 fungi-transport-arti = { path = "../fungi-transport-arti" }
+fungi-transport-socks5h = { path = "../fungi-transport-socks5h" }
 # The driver needs arti config types directly for --private-net:
 arti-client = { version = "=0.45.0", default-features = false, features = [
     "tokio",
@@ -23,6 +24,10 @@ arti-client = { version = "=0.45.0", default-features = false, features = [
 tor-llcrypto = "=0.45.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 futures-util = { version = "0.3", default-features = false }
+# Already in the tree via arti's own dependency graph; declared explicitly
+# here because the driver installs a rustls CryptoProvider itself before
+# bootstrapping arti (see run.rs::arti_transport).
+rustls = { version = "0.23", features = ["ring"] }
 
 [lints]
 workspace = true

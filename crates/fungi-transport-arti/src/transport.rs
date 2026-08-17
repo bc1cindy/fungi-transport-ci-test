@@ -76,11 +76,19 @@ impl ArtiTransport {
     /// `bootstrap`, e.g. `rustls::crypto::ring::default_provider().install_default()`
     /// (or the `aws_lc_rs` equivalent).
     pub async fn bootstrap(cfg: ArtiConfig) -> Result<Self, ConnectError> {
-        let tor_cfg = tor_config(&cfg)?;
+        Self::bootstrap_with(tor_config(&cfg)?, cfg.max_msg_len).await
+    }
+
+    /// Bootstrap with a caller-built [`TorClientConfig`] (e.g. a private
+    /// test network's authorities); `max_msg_len` as in [`ArtiConfig`].
+    pub async fn bootstrap_with(
+        tor_cfg: TorClientConfig,
+        max_msg_len: usize,
+    ) -> Result<Self, ConnectError> {
         let client = TorClient::create_bootstrapped(tor_cfg)
             .await
             .map_err(connect_error)?;
-        Ok(Self::from_client(client, cfg.max_msg_len))
+        Ok(Self::from_client(client, max_msg_len))
     }
 
     /// Wrap an existing client (deterministic tests use an unbootstrapped

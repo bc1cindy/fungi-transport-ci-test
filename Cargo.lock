@@ -1347,7 +1347,9 @@ dependencies = [
  "arti-client",
  "fungi-transport",
  "fungi-transport-arti",
+ "fungi-transport-socks5h",
  "futures-util",
+ "rustls",
  "tokio",
  "tor-llcrypto",
 ]
