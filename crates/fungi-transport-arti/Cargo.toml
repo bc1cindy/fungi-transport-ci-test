@@ -29,6 +29,8 @@ tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rustls = { version = "0.23", features = ["ring"] }
+ring = "0.17"
 
 [lints]
 workspace = true

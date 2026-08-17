@@ -13,7 +13,6 @@ use fungi_transport::ConnectError;
 /// but we couldn't connect to it" outcome (e.g. its descriptor hasn't
 /// propagated yet, or the introduction circuit failed) — it is the
 /// consumer's cue to retry later, same as the other kinds here.
-#[allow(dead_code)]
 pub(crate) fn kind_is_unreachable(kind: ErrorKind) -> bool {
     matches!(
         kind,
@@ -25,7 +24,6 @@ pub(crate) fn kind_is_unreachable(kind: ErrorKind) -> bool {
 }
 
 /// Convert an arti error into the trait-level connect error.
-#[allow(dead_code)]
 pub(crate) fn connect_error(e: ArtiError) -> ConnectError {
     if kind_is_unreachable(e.kind()) {
         ConnectError::Unreachable

@@ -6,3 +6,6 @@
 //! delimitation is the same [`fungi_transport::framed`] length-prefix layer.
 
 mod error;
+mod transport;
+
+pub use transport::{ArtiConfig, ArtiTransport};
