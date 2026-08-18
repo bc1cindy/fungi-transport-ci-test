@@ -1,0 +1,263 @@
+//! Minimal tor control-port client: authenticate, publish one onion
+//! service. The service lives as long as the control connection — dropping
+//! it is the cleanup (no DEL_ONION needed).
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+
+use fungi_transport::ConnectError;
+
+/// How to authenticate on the daemon's control port.
+#[derive(Debug, Clone)]
+pub enum ControlAuth {
+    /// No authentication configured on the daemon.
+    Null,
+    /// Cookie authentication: send the hex of this file's contents.
+    CookieFile(PathBuf),
+}
+
+/// A published onion service. `service_id` has no `.onion` suffix. The
+/// daemon removes the service when `conn` drops.
+pub(crate) struct OnionService {
+    pub(crate) service_id: String,
+    /// Held for side effects only: the service dies when the connection closes.
+    #[allow(dead_code)]
+    pub(crate) conn: BufReader<TcpStream>,
+}
+
+impl std::fmt::Debug for OnionService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnionService")
+            .field("service_id", &self.service_id)
+            .finish_non_exhaustive()
+    }
+}
+
+fn io_err(e: std::io::Error) -> ConnectError {
+    ConnectError::Transport(e.into())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+async fn read_reply_line(conn: &mut BufReader<TcpStream>) -> Result<String, ConnectError> {
+    let mut line = String::new();
+    let n = conn.read_line(&mut line).await.map_err(io_err)?;
+    if n == 0 {
+        return Err(ConnectError::Transport(
+            "control connection closed by daemon".into(),
+        ));
+    }
+    Ok(line.trim_end().to_owned())
+}
+
+/// Expect a single-line `250 OK`-style success reply. A `250-` continuation
+/// line here means the reply is multi-line where we expected exactly one —
+/// that is a protocol desync, not success, so it errors rather than being
+/// mistaken for `250`-prefixed success.
+async fn expect_ok(conn: &mut BufReader<TcpStream>) -> Result<(), ConnectError> {
+    let line = read_reply_line(conn).await?;
+    if let Some(rest) = line.strip_prefix("250-") {
+        return Err(ConnectError::Transport(
+            format!(
+                "control port desynchronized: expected a single-line reply but got a \
+                 continuation line: 250-{rest}"
+            )
+            .into(),
+        ));
+    }
+    if line == "250" || line.starts_with("250 ") {
+        Ok(())
+    } else {
+        Err(ConnectError::Transport(
+            format!("control port replied: {line}").into(),
+        ))
+    }
+}
+
+/// Authenticate and publish an ephemeral v3 onion service forwarding
+/// `virt_port` to `127.0.0.1:local_port`.
+pub(crate) async fn create_onion(
+    control: SocketAddr,
+    auth: &ControlAuth,
+    virt_port: u16,
+    local_port: u16,
+) -> Result<OnionService, ConnectError> {
+    let stream = TcpStream::connect(control).await.map_err(io_err)?;
+    let mut conn = BufReader::new(stream);
+
+    let auth_line = match auth {
+        ControlAuth::Null => "AUTHENTICATE\r\n".to_owned(),
+        ControlAuth::CookieFile(path) => {
+            let cookie = tokio::fs::read(path).await.map_err(io_err)?;
+            format!("AUTHENTICATE {}\r\n", hex(&cookie))
+        }
+    };
+    conn.get_mut()
+        .write_all(auth_line.as_bytes())
+        .await
+        .map_err(io_err)?;
+    expect_ok(&mut conn).await?;
+
+    // DiscardPK: the identity is ephemeral by design — a fresh onion
+    // address per listener; we never reuse the key.
+    let cmd = format!(
+        "ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port={virt_port},127.0.0.1:{local_port}\r\n"
+    );
+    conn.get_mut()
+        .write_all(cmd.as_bytes())
+        .await
+        .map_err(io_err)?;
+
+    // Per the control-spec reply grammar, `250-` marks a continuation line
+    // and `250 ` (space) marks the final line of the reply. Any line other
+    // than a `250-` continuation or the final `250 OK` — including another
+    // `250 <something>` final line, or a non-250 code — is an error; reading
+    // one more line for it would block forever, since the daemon has
+    // already sent its whole reply.
+    let mut service_id = None;
+    loop {
+        let line = read_reply_line(&mut conn).await?;
+        if let Some(id) = line.strip_prefix("250-ServiceID=") {
+            service_id = Some(id.to_owned());
+        } else if line.starts_with("250-") {
+            // Other continuation lines (e.g. PrivateKey) are ignored.
+        } else if line == "250 OK" {
+            break;
+        } else {
+            return Err(ConnectError::Transport(
+                format!("ADD_ONION failed: {line}").into(),
+            ));
+        }
+    }
+    let service_id = service_id
+        .ok_or_else(|| ConnectError::Transport("ADD_ONION reply carried no ServiceID".into()))?;
+
+    Ok(OnionService { service_id, conn })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// One-connection fake control port. Asserts the AUTHENTICATE line
+    /// equals `expect_auth`, then answers ADD_ONION with `service_id`.
+    async fn fake_control(listener: TcpListener, expect_auth: String, service_id: &str) {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut sock = BufReader::new(sock);
+        let mut line = String::new();
+        sock.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim_end(), expect_auth);
+        sock.get_mut().write_all(b"250 OK\r\n").await.unwrap();
+        line.clear();
+        sock.read_line(&mut line).await.unwrap();
+        let line = line.trim_end();
+        assert!(
+            line.starts_with("ADD_ONION NEW:ED25519-V3 Flags=DiscardPK Port="),
+            "unexpected command: {line}"
+        );
+        sock.get_mut()
+            .write_all(format!("250-ServiceID={service_id}\r\n250 OK\r\n").as_bytes())
+            .await
+            .unwrap();
+        // Hold the connection open until the client drops it (the service's
+        // lifetime is the connection's lifetime).
+        let mut rest = String::new();
+        let _ = sock.read_line(&mut rest).await;
+    }
+
+    #[tokio::test]
+    async fn null_auth_creates_onion() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = listener.local_addr().unwrap();
+        tokio::spawn(fake_control(
+            listener,
+            "AUTHENTICATE".into(),
+            "fungi000service0id",
+        ));
+        let svc = create_onion(control, &ControlAuth::Null, 9735, 40001)
+            .await
+            .unwrap();
+        assert_eq!(svc.service_id, "fungi000service0id");
+    }
+
+    #[tokio::test]
+    async fn cookie_auth_sends_hex_of_cookie_file() {
+        let cookie_path =
+            std::env::temp_dir().join(format!("fungi-test-cookie-{}", std::process::id()));
+        std::fs::write(&cookie_path, [0xde, 0xad, 0xbe, 0xef]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = listener.local_addr().unwrap();
+        tokio::spawn(fake_control(
+            listener,
+            "AUTHENTICATE DEADBEEF".into(),
+            "cookieauthedid",
+        ));
+        let svc = create_onion(control, &ControlAuth::CookieFile(cookie_path.clone()), 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(svc.service_id, "cookieauthedid");
+        std::fs::remove_file(cookie_path).ok();
+    }
+
+    #[tokio::test]
+    async fn error_reply_maps_to_transport_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut sock = BufReader::new(sock);
+            let mut line = String::new();
+            sock.read_line(&mut line).await.unwrap();
+            sock.get_mut()
+                .write_all(b"515 Authentication failed\r\n")
+                .await
+                .unwrap();
+        });
+        let err = create_onion(control, &ControlAuth::Null, 1, 2).await;
+        assert!(matches!(
+            err,
+            Err(fungi_transport::ConnectError::Transport(_))
+        ));
+    }
+
+    /// A `250-` continuation followed by a final line that isn't `250 OK`
+    /// (e.g. `250 DONE`) must error immediately, not hang waiting for a
+    /// line the daemon will never send. Regression test for the reply-loop
+    /// hang: `Err` within the timeout, not a wedged read.
+    #[tokio::test]
+    async fn non_ok_final_line_errors_instead_of_hanging() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut sock = BufReader::new(sock);
+            let mut line = String::new();
+            sock.read_line(&mut line).await.unwrap(); // AUTHENTICATE
+            sock.get_mut().write_all(b"250 OK\r\n").await.unwrap();
+            line.clear();
+            sock.read_line(&mut line).await.unwrap(); // ADD_ONION
+            sock.get_mut()
+                .write_all(b"250-ServiceID=x\r\n250 DONE\r\n")
+                .await
+                .unwrap();
+            // Hold the connection open; if the client is hung reading, this
+            // keeps the test from succeeding by accident on EOF.
+            let mut rest = String::new();
+            let _ = sock.read_line(&mut rest).await;
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_onion(control, &ControlAuth::Null, 1, 2),
+        )
+        .await
+        .expect("create_onion hung instead of returning an error");
+        assert!(matches!(result, Err(ConnectError::Transport(_))));
+    }
+}

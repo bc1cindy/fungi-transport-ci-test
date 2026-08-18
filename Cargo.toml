@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/fungi-transport"]
+members = [
+    "crates/fungi-transport",
+    "crates/fungi-transport-socks5h",
+]
 
 [workspace.package]
 version = "0.1.0"

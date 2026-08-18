@@ -1,0 +1,16 @@
+[package]
+name = "fungi-transport-socks5h"
+description = "SOCKS5h + control-port Tor backend (external daemon) for the fungi P2P datagram channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fungi-transport = { path = "../fungi-transport" }
+tokio = { version = "1", features = ["net", "io-util", "fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
