@@ -1,0 +1,22 @@
+[package]
+name = "fungi-transport-capnp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+capnp = "0.21"
+capnp-rpc = "0.21"
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+fungi-transport = { path = "../fungi-transport" }
+
+[build-dependencies]
+capnpc = "0.21"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net", "time", "rt-multi-thread"] }
