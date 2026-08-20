@@ -50,7 +50,7 @@ impl Connector for ArtiConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{ArtiConfig, ArtiTransport, tor_config};
+    use crate::transport::{ArtiConfig, ArtiTransport, test_config};
     use arti_client::BootstrapBehavior;
 
     fn unbootstrapped() -> ArtiTransport {
@@ -59,7 +59,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("fungi-arti-conn-{}", std::process::id()));
         let cfg = ArtiConfig::new(base.join("state"), base.join("cache"));
         let client = TorClient::builder()
-            .config(tor_config(&cfg).unwrap())
+            .config(test_config(&cfg))
             .bootstrap_behavior(BootstrapBehavior::Manual)
             .create_unbootstrapped()
             .unwrap();

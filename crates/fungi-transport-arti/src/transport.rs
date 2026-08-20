@@ -41,11 +41,25 @@ impl ArtiConfig {
     }
 }
 
-/// Map an [`ArtiConfig`] onto arti's own config type.
+/// Map an [`ArtiConfig`] onto arti's own config type. fs-mistrust (arti's
+/// filesystem permission guard, which protects onion-service keys) stays on:
+/// the VM path relaxes it out of band by setting
+/// `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS` on the plugin process, so production
+/// stays strict by default.
 pub(crate) fn tor_config(cfg: &ArtiConfig) -> Result<TorClientConfig, ConnectError> {
     TorClientConfigBuilder::from_directories(&cfg.state_dir, &cfg.cache_dir)
         .build()
         .map_err(|e| ConnectError::Transport(e.into()))
+}
+
+/// Like [`tor_config`], but with arti's fs-mistrust guard relaxed on this one
+/// config — for tests whose sandbox/CI temp dirs the guard would reject.
+/// Relaxing per-config is thread-safe, unlike mutating the global environment.
+#[cfg(test)]
+pub(crate) fn test_config(cfg: &ArtiConfig) -> TorClientConfig {
+    let mut b = TorClientConfigBuilder::from_directories(&cfg.state_dir, &cfg.cache_dir);
+    b.storage().permissions().dangerously_trust_everyone();
+    b.build().expect("building the test tor config")
 }
 
 /// A bootstrapped in-process Tor client, source of both channel halves.
@@ -112,6 +126,39 @@ impl ArtiTransport {
     }
 }
 
+impl fungi_transport::Transport for ArtiTransport {
+    type Addr = fungi_transport::OnionAddr;
+    type Connector = crate::ArtiConnector;
+    type Listener = crate::ArtiListener;
+
+    fn connector(&self) -> crate::ArtiConnector {
+        // Build the connector from the shared client (same as the inherent
+        // `connector`); the inherent method stays for direct callers.
+        crate::ArtiConnector {
+            client: self.client.clone(),
+            max_msg_len: self.max_msg_len,
+        }
+    }
+
+    fn listen(
+        &self,
+        params: fungi_transport::ListenParams,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (crate::ArtiListener, fungi_transport::OnionAddr),
+            fungi_transport::ConnectError,
+        >,
+    > + Send {
+        // arti identity is persistent per nickname; default when unspecified.
+        let nickname = params.nickname.unwrap_or_else(|| "fungi".to_string());
+        async move {
+            let listener = self.listen(&nickname, params.virt_port).await?;
+            let addr = listener.onion_addr().clone();
+            Ok((listener, addr))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,11 +190,30 @@ mod tests {
         let _ = default_provider().install_default();
         let cfg = ArtiConfig::new(tmp("s3"), tmp("c3"));
         let client = TorClient::builder()
-            .config(tor_config(&cfg).unwrap())
+            .config(test_config(&cfg))
             .bootstrap_behavior(BootstrapBehavior::Manual)
             .create_unbootstrapped();
         assert!(client.is_ok());
         let transport = ArtiTransport::from_client(client.unwrap(), cfg.max_msg_len);
         let _ = format!("{transport:?}");
+    }
+
+    /// Compile-time contract: ArtiTransport implements the factory trait with the
+    /// arti connector/listener and the shared onion address. Compiling is the
+    /// assertion.
+    #[allow(dead_code)]
+    fn arti_is_transport()
+    where
+        ArtiTransport: fungi_transport::Transport<
+                Addr = fungi_transport::OnionAddr,
+                Connector = crate::ArtiConnector,
+                Listener = crate::ArtiListener,
+            > + Send,
+    {
+    }
+
+    #[test]
+    fn transport_contract_holds() {
+        // arti_is_transport compiling IS the assertion.
     }
 }
