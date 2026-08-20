@@ -79,6 +79,20 @@ async fn closed_propagates_over_capnp() {
     testkit::closed_after_peer_drop(capnp_a, capnp_b).await;
 }
 
+/// Proves the adapter's local size check: a message larger than the channel's
+/// declared maximum is rejected with `SendError::TooLarge { max }` by the
+/// adapter itself, before any RPC — so the server never needs to see it. The
+/// loopback server is present only so the channel is otherwise usable.
+#[tokio::test]
+async fn too_large_rejected_locally_over_capnp() {
+    const MAX: usize = 4;
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let _server = serve_loopback(server_io);
+    let channel = CapnpChannel::connect_with(client_io, MAX);
+
+    testkit::too_large(channel, MAX).await;
+}
+
 /// Proves the I2 fix: dropping a `CapnpChannel` while a `recv` is parked on an
 /// empty backend still terminates the actor thread AND the server thread,
 /// rather than leaking them forever. The peer end of the mem pair is kept

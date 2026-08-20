@@ -54,6 +54,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use fungi_transport::framed::DEFAULT_MAX_MSG_LEN;
 use fungi_transport::mem::MemAddr;
 use fungi_transport::{
     Channel, ConnectError, Connector, ListenParams, Listener, RecvError, SendError, Transport,
@@ -450,7 +451,14 @@ where
                         None => Err(RecvError::Closed),
                     };
                     let mut reg = registry.borrow_mut();
-                    let state = reg.recv_states.entry(channel_id).or_default();
+                    // The channel may have been released while this recv was in
+                    // flight; its state is then gone. Look it up rather than
+                    // re-creating it — an `entry().or_default()` here would
+                    // resurrect the entry Release removed and leak it for the
+                    // connection's life. If it's gone, drop the message.
+                    let Some(state) = reg.recv_states.get_mut(&channel_id) else {
+                        return;
+                    };
                     state.in_flight = false;
                     match state.waiter.take() {
                         // A dropped waiter loses no message: a successful one is
@@ -559,6 +567,10 @@ fn backend_connect_error_to_capnp(e: ConnectError) -> capnp::Error {
 pub struct CapnpTransport<A = MemAddr> {
     tx: mpsc::Sender<Command>,
     transport_id: u64,
+    /// The adapter's known maximum message size. It bounds `send` locally on
+    /// every channel derived from this transport, so an oversized message is
+    /// rejected here rather than round-tripped to the plugin.
+    max_msg_len: usize,
     _addr: PhantomData<fn() -> A>,
 }
 
@@ -572,7 +584,19 @@ where
     /// This spawns the connection's actor thread and pipelines the plugin's
     /// `transport()` immediately, so the handle is usable without a round trip;
     /// the first factory call resolves it.
+    ///
+    /// Channels derived from this transport use the default maximum message
+    /// size; use [`connect_with`](Self::connect_with) to pick another.
     pub fn connect<Io>(io: Io) -> Self
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::connect_with(io, DEFAULT_MAX_MSG_LEN)
+    }
+
+    /// Like [`connect`](Self::connect), but with an explicit maximum message
+    /// size that bounds `send` on every channel derived from this transport.
+    pub fn connect_with<Io>(io: Io, max_msg_len: usize) -> Self
     where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
@@ -582,6 +606,7 @@ where
         Self {
             tx,
             transport_id: BOOTSTRAP_ID,
+            max_msg_len,
             _addr: PhantomData,
         }
     }
@@ -605,7 +630,23 @@ where
 /// completes, surfaces as [`ConnectError::Unreachable`] on the first transport
 /// operation (never a hang or a panic). A mid-session disconnect maps to a
 /// closed channel, as with the in-process path.
-pub fn connect_plugin<A>(mut command: tokio::process::Command) -> CapnpTransport<A>
+///
+/// Channels derived from the returned transport use the default maximum message
+/// size; use [`connect_plugin_with`] to pick another.
+pub fn connect_plugin<A>(command: tokio::process::Command) -> CapnpTransport<A>
+where
+    A: FromStr + Display + Send + Sync + 'static,
+{
+    connect_plugin_with(command, DEFAULT_MAX_MSG_LEN)
+}
+
+/// Like [`connect_plugin`], but with an explicit maximum message size that
+/// bounds `send` on every channel derived from the returned transport (an
+/// oversized message is rejected by the adapter before the RPC).
+pub fn connect_plugin_with<A>(
+    mut command: tokio::process::Command,
+    max_msg_len: usize,
+) -> CapnpTransport<A>
 where
     A: FromStr + Display + Send + Sync + 'static,
 {
@@ -654,6 +695,7 @@ where
     CapnpTransport {
         tx,
         transport_id: BOOTSTRAP_ID,
+        max_msg_len,
         _addr: PhantomData,
     }
 }
@@ -671,6 +713,7 @@ where
             tx: self.tx.clone(),
             transport_id: self.transport_id,
             connector_id: tokio::sync::OnceCell::new(),
+            max_msg_len: self.max_msg_len,
             _addr: PhantomData,
         }
     }
@@ -681,6 +724,7 @@ where
     ) -> impl Future<Output = Result<(CapnpListener, A), ConnectError>> + Send {
         let tx = self.tx.clone();
         let transport_id = self.transport_id;
+        let max_msg_len = self.max_msg_len;
         async move {
             let (reply, rx) = oneshot::channel();
             tx.send(Command::Listen {
@@ -695,7 +739,14 @@ where
             let addr = addr_text
                 .parse()
                 .map_err(|_| ConnectError::Transport("unparseable listener address".into()))?;
-            Ok((CapnpListener { tx, listener_id }, addr))
+            Ok((
+                CapnpListener {
+                    tx,
+                    listener_id,
+                    max_msg_len,
+                },
+                addr,
+            ))
         }
     }
 }
@@ -708,6 +759,7 @@ pub struct CapnpConnector<A = MemAddr> {
     tx: mpsc::Sender<Command>,
     transport_id: u64,
     connector_id: tokio::sync::OnceCell<u64>,
+    max_msg_len: usize,
     _addr: PhantomData<fn() -> A>,
 }
 
@@ -755,12 +807,17 @@ where
             Ok(CapnpChannel {
                 tx: self.tx.clone(),
                 channel_id,
+                max_msg_len: self.max_msg_len,
             })
         }
     }
 }
 
 impl<A> Drop for CapnpConnector<A> {
+    // Best-effort release: `Drop` cannot block or await, so it must use
+    // `try_send`. A saturated command queue therefore drops this `Release`,
+    // leaking the one remote capability until the connection is torn down.
+    // That trade-off is inherent — blocking in `Drop` is not an option.
     fn drop(&mut self) {
         if let Some(&id) = self.connector_id.get() {
             let _ = self.tx.try_send(Command::Release { id });
@@ -774,6 +831,7 @@ impl<A> Drop for CapnpConnector<A> {
 pub struct CapnpListener {
     tx: mpsc::Sender<Command>,
     listener_id: u64,
+    max_msg_len: usize,
 }
 
 impl Listener for CapnpListener {
@@ -782,18 +840,26 @@ impl Listener for CapnpListener {
     fn accept(&mut self) -> impl Future<Output = Result<CapnpChannel, ConnectError>> + Send {
         let tx = self.tx.clone();
         let listener_id = self.listener_id;
+        let max_msg_len = self.max_msg_len;
         async move {
             let (reply, rx) = oneshot::channel();
             tx.send(Command::Accept { listener_id, reply })
                 .await
                 .map_err(|_| ConnectError::Unreachable)?;
             let channel_id = rx.await.map_err(|_| ConnectError::Unreachable)??;
-            Ok(CapnpChannel { tx, channel_id })
+            Ok(CapnpChannel {
+                tx,
+                channel_id,
+                max_msg_len,
+            })
         }
     }
 }
 
 impl Drop for CapnpListener {
+    // Best-effort release: see the note on `CapnpConnector`'s `Drop`. A full
+    // command queue can drop this `Release`, leaking the remote listener until
+    // connection teardown; `Drop` cannot block/await to avoid it.
     fn drop(&mut self) {
         let _ = self.tx.try_send(Command::Release {
             id: self.listener_id,
@@ -814,6 +880,9 @@ impl Drop for CapnpListener {
 pub struct CapnpChannel {
     tx: mpsc::Sender<Command>,
     channel_id: u64,
+    /// The adapter's known maximum message size; `send` rejects anything larger
+    /// locally, before touching the actor.
+    max_msg_len: usize,
 }
 
 impl CapnpChannel {
@@ -822,8 +891,18 @@ impl CapnpChannel {
     ///
     /// This spawns a dedicated actor thread whose bootstrap capability is the
     /// remote `Channel`; the thread drives the capnp-rpc client and services
-    /// commands until this handle is dropped.
+    /// commands until this handle is dropped. It uses the default maximum
+    /// message size; use [`connect_with`](Self::connect_with) to pick another.
     pub fn connect<Io>(io: Io) -> Self
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::connect_with(io, DEFAULT_MAX_MSG_LEN)
+    }
+
+    /// Like [`connect`](Self::connect), but with an explicit maximum message
+    /// size that bounds `send` on this channel.
+    pub fn connect_with<Io>(io: Io, max_msg_len: usize) -> Self
     where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
@@ -833,16 +912,27 @@ impl CapnpChannel {
         Self {
             tx,
             channel_id: BOOTSTRAP_ID,
+            max_msg_len,
         }
     }
 }
 
 impl Channel for CapnpChannel {
     fn send(&mut self, msg: &[u8]) -> impl Future<Output = Result<(), SendError>> + Send {
+        // Reject an oversized message with the adapter's known limit before it
+        // ever reaches the actor: the check is local, so no RPC is made. Test
+        // the length FIRST, before copying — an oversized message is rejected
+        // without ever being allocated.
+        let too_large = (msg.len() > self.max_msg_len).then_some(self.max_msg_len);
         let tx = self.tx.clone();
         let channel_id = self.channel_id;
-        let msg = msg.to_vec();
+        // Copy only a within-bounds message into the returned `'static` future.
+        let msg = too_large.is_none().then(|| msg.to_vec());
         async move {
+            let msg = match too_large {
+                Some(max) => return Err(SendError::TooLarge { max }),
+                None => msg.expect("a within-bounds message is always copied"),
+            };
             let (reply, rx) = oneshot::channel();
             tx.send(Command::Send {
                 channel_id,
@@ -869,6 +959,9 @@ impl Channel for CapnpChannel {
 }
 
 impl Drop for CapnpChannel {
+    // Best-effort release: see the note on `CapnpConnector`'s `Drop`. A full
+    // command queue can drop this `Release`, leaking the remote channel until
+    // connection teardown; `Drop` cannot block/await to avoid it.
     fn drop(&mut self) {
         let _ = self.tx.try_send(Command::Release {
             id: self.channel_id,

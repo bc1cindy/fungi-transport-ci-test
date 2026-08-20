@@ -24,7 +24,7 @@ pub mod harness;
 pub mod mem;
 pub mod testkit;
 
-pub use addr::OnionAddr;
+pub use addr::{OnionAddr, ParseOnionAddrError};
 pub use channel::{Channel, Connector, ListenParams, Listener, Transport, into_stream};
 pub use error::{BoxError, ConnectError, RecvError, SendError};
 pub use harness::{dial_sequence, echo_one_peer};

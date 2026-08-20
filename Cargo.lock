@@ -1376,12 +1376,14 @@ version = "0.1.0"
 dependencies = [
  "arti-client",
  "fungi-transport",
+ "fungi-transport-capnp",
  "futures-util",
  "rustls",
  "safelog",
  "tokio",
  "tor-cell",
  "tor-hsservice",
+ "tor-llcrypto",
  "tor-proto",
  "tor-rtcompat",
 ]
@@ -1418,6 +1420,7 @@ name = "fungi-transport-socks5h"
 version = "0.1.0"
 dependencies = [
  "fungi-transport",
+ "fungi-transport-capnp",
  "tokio",
 ]
 
