@@ -141,9 +141,15 @@ impl Channel for MemChannel {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemAddr;
 
+impl std::fmt::Display for MemAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mem")
+    }
+}
+
 /// Connector half of an in-memory network: each `connect` produces a fresh
 /// channel pair, handing the far end to the paired [`MemListener`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemConnector {
     cfg: MemConfig,
     to_listener: mpsc::Sender<MemChannel>,
@@ -159,6 +165,49 @@ pub struct MemListener {
 pub fn network(cfg: MemConfig) -> (MemConnector, MemListener) {
     let (to_listener, inbound) = mpsc::channel(8);
     (MemConnector { cfg, to_listener }, MemListener { inbound })
+}
+
+/// In-memory [`Transport`](crate::channel::Transport): a factory over one
+/// in-memory network. `listen` yields the network's single listener once;
+/// further calls are `Unreachable`.
+#[derive(Debug)]
+pub struct MemTransport {
+    connector: MemConnector,
+    listener: std::sync::Mutex<Option<MemListener>>,
+}
+
+impl MemTransport {
+    /// A transport over a fresh in-memory network.
+    pub fn new(cfg: MemConfig) -> Self {
+        let (connector, listener) = network(cfg);
+        Self {
+            connector,
+            listener: std::sync::Mutex::new(Some(listener)),
+        }
+    }
+}
+
+impl crate::channel::Transport for MemTransport {
+    type Addr = MemAddr;
+    type Connector = MemConnector;
+    type Listener = MemListener;
+
+    fn connector(&self) -> MemConnector {
+        self.connector.clone()
+    }
+
+    async fn listen(
+        &self,
+        _params: crate::channel::ListenParams,
+    ) -> Result<(MemListener, MemAddr), ConnectError> {
+        let listener = self
+            .listener
+            .lock()
+            .expect("mem transport listener mutex")
+            .take()
+            .ok_or(ConnectError::Unreachable)?;
+        Ok((listener, MemAddr))
+    }
 }
 
 impl Connector for MemConnector {
@@ -371,6 +420,30 @@ mod tests {
         assert!(matches!(
             listener.accept().await,
             Err(ConnectError::Unreachable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mem_transport_dials_and_accepts() {
+        use crate::channel::{Channel, Connector, ListenParams, Listener, Transport};
+        let transport = MemTransport::new(MemConfig::default());
+        let connector = transport.connector();
+        let (mut listener, _addr) = transport.listen(ListenParams::new(1)).await.unwrap();
+        let (client, server) =
+            futures_util::future::join(connector.connect(&MemAddr), listener.accept()).await;
+        let (mut client, mut server) = (client.unwrap(), server.unwrap());
+        client.send(b"hi").await.unwrap();
+        assert_eq!(server.recv().await.unwrap(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn mem_transport_listen_is_single_use() {
+        use crate::channel::{ListenParams, Transport};
+        let transport = MemTransport::new(MemConfig::default());
+        let _first = transport.listen(ListenParams::new(1)).await.unwrap();
+        assert!(matches!(
+            transport.listen(ListenParams::new(1)).await,
+            Err(crate::error::ConnectError::Unreachable)
         ));
     }
 }

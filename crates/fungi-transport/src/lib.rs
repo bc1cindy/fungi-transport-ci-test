@@ -24,5 +24,5 @@ pub mod mem;
 pub mod testkit;
 
 pub use addr::OnionAddr;
-pub use channel::{Channel, Connector, Listener, into_stream};
+pub use channel::{Channel, Connector, ListenParams, Listener, Transport, into_stream};
 pub use error::{BoxError, ConnectError, RecvError, SendError};

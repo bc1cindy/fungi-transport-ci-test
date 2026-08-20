@@ -85,6 +85,54 @@ pub trait Listener: Send {
     fn accept(&mut self) -> impl Future<Output = Result<Self::Channel, ConnectError>> + Send;
 }
 
+/// Backend-agnostic parameters for creating a listener.
+#[derive(Debug, Clone, Default)]
+pub struct ListenParams {
+    /// The virtual port the onion service listens on.
+    pub virt_port: u16,
+    /// Identity hint: a nickname (persistent identity, e.g. arti) or `None`
+    /// for an ephemeral identity (e.g. the SOCKS5h DiscardPK onion).
+    pub nickname: Option<String>,
+}
+
+impl ListenParams {
+    /// Parameters for an ephemeral listener on `virt_port`.
+    pub fn new(virt_port: u16) -> Self {
+        Self {
+            virt_port,
+            nickname: None,
+        }
+    }
+
+    /// Attach a persistent-identity nickname.
+    pub fn with_nickname(mut self, nickname: impl Into<String>) -> Self {
+        self.nickname = Some(nickname.into());
+        self
+    }
+}
+
+/// A transport factory: opens connectors and creates listeners (publishing an
+/// onion identity). Connection initiation and identity creation live here —
+/// the surface beyond the per-message [`Channel`].
+pub trait Transport: Send {
+    /// Transport-native peer address, shared with the connector.
+    type Addr: Send + Sync;
+    /// The connector this transport produces.
+    type Connector: Connector<Addr = Self::Addr>;
+    /// The listener this transport produces.
+    type Listener: Listener;
+
+    /// A connector for dialing peers.
+    fn connector(&self) -> Self::Connector;
+
+    /// Create and publish a listener, returning it together with the onion
+    /// address it was published under (the generated/loaded identity).
+    fn listen(
+        &self,
+        params: ListenParams,
+    ) -> impl Future<Output = Result<(Self::Listener, Self::Addr), ConnectError>> + Send;
+}
+
 /// Adapt any [`Channel`] into a [`Stream`] of received messages. An adapter
 /// for consumers who prefer a `Stream`; `Stream` is deliberately not part of
 /// the trait contract. The stream ends after the first error.
