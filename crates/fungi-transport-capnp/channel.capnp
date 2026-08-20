@@ -1,8 +1,9 @@
 @0xfd90a0bb844c5a05;
 
 # The plugin protocol, mirroring the fungi-transport Rust traits over capnp-rpc.
-# Only the Channel level is implemented in this phase; the remaining interfaces
-# fix the wire shape the plugin layer will grow into.
+# Channel/Connector/Listener/Transport are the primary bindings the harness
+# drives. TestFixtures is a separate test-only tier for setup/teardown, kept off
+# the primary path; a backend that needs no test-time setup exposes a no-op.
 
 # One connected peer: opaque bytes, one message per call. Mirrors the Rust
 # `Channel` trait (method 0 = send, method 1 = recv).

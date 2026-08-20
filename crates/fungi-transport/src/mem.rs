@@ -147,6 +147,17 @@ impl std::fmt::Display for MemAddr {
     }
 }
 
+impl std::str::FromStr for MemAddr {
+    type Err = std::convert::Infallible;
+
+    /// There is only one in-memory endpoint per network, so any text parses to
+    /// the single unit address. This lets a `MemAddr` round-trip through a
+    /// transport (e.g. capnp) that carries addresses as text.
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        Ok(MemAddr)
+    }
+}
+
 /// Connector half of an in-memory network: each `connect` produces a fresh
 /// channel pair, handing the far end to the paired [`MemListener`].
 #[derive(Debug, Clone)]
