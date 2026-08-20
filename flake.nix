@@ -24,13 +24,14 @@
           # transport module derive an identical craneLib/commonArgs/cargoArtifacts.
           crane = import ./nix/lib/crane.nix { inherit inputs system; };
           inherit (crane) pkgs rustToolchain craneLib commonArgs cargoArtifacts buildCrate;
-          # The generic driver binary. Today `fungi-transport-e2e`; Phase 5's VM
-          # test spawns plugins through it, so it is also exported as `harness`.
-          e2e = buildCrate { pname = "fungi-transport-e2e"; crate = "fungi-transport-e2e"; };
+          # The generic test-network driver: a binary in the capnp crate that
+          # spawns each backend as a plugin subprocess and drives it over the
+          # Transport trait. It links no backend, so it lives with the plugin
+          # client machinery rather than in a crate of its own.
+          harness = buildCrate { pname = "harness"; crate = "fungi-transport-capnp"; bin = "harness"; };
         in {
-          packages.fungi-transport-e2e = e2e;
-          packages.harness = e2e;
-          packages.default = e2e;
+          packages.harness = harness;
+          packages.default = harness;
 
           devShells.default = pkgs.mkShell {
             packages = [ rustToolchain pkgs.just pkgs.cargo-nextest ];

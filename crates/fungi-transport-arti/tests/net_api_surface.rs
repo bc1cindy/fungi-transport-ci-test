@@ -1,5 +1,5 @@
-//! Compile-time probe of the arti network-override API used by src/net.rs.
-//! No test here touches the network.
+//! Compile-time probe of the arti network-override API used by
+//! src/private_net.rs. No test here touches the network.
 
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::config::dir;
@@ -53,7 +53,7 @@ fn network_override_surface() {
     *b.tor_network().authorities() = authorities;
     b.tor_network().set_fallback_caches(vec![fallback]);
 
-    // Testing-network tolerances used by src/net.rs:
+    // Testing-network tolerances used by src/private_net.rs:
     b.directory_tolerance()
         .pre_valid_tolerance(std::time::Duration::from_secs(300));
     b.directory_tolerance()

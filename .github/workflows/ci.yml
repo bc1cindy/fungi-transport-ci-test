@@ -19,3 +19,30 @@ jobs:
             .#checks.x86_64-linux.clippy \
             .#checks.x86_64-linux.fmt \
             .#checks.x86_64-linux.doc
+
+  # Cross-backend onion VM test (~1h, deterministic): runs after merge to main,
+  # never on the PR path. The shared-random cycle it waits on is inherently slow,
+  # so gate it on push (a merge) rather than paying it on every PR revision.
+  e2e:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # The tor-e2e check boots NixOS VMs, which need KVM. The runner exposes
+      # /dev/kvm but the runner user is not in the kvm group; grant world access
+      # via a udev rule and re-trigger so the node it applies to picks it up.
+      - name: Enable KVM access for the runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The arti build plus the VM disk images are large; the stock runner image
+      # ships toolchains that crowd the disk. Reclaim space before the build.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - run: nix build -L .#checks.x86_64-linux.tor-e2e

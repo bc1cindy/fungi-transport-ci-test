@@ -5,7 +5,6 @@ members = [
     "crates/fungi-transport-capnp",
     "crates/fungi-transport-socks5h",
     "crates/fungi-transport-arti",
-    "crates/fungi-transport-e2e",
 ]
 
 [workspace.package]

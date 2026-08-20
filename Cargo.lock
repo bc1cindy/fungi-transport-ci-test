@@ -1402,20 +1402,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fungi-transport-e2e"
-version = "0.1.0"
-dependencies = [
- "arti-client",
- "fungi-transport",
- "fungi-transport-arti",
- "fungi-transport-socks5h",
- "futures-util",
- "rustls",
- "tokio",
- "tor-llcrypto",
-]
-
-[[package]]
 name = "fungi-transport-socks5h"
 version = "0.1.0"
 dependencies = [

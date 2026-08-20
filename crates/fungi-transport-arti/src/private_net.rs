@@ -1,32 +1,51 @@
-//! `--private-net` file: point arti at the VM network's own directory
-//! authorities and fallback caches instead of the real Tor network.
+//! `--private-net` descriptor: point arti at a private test network's own
+//! directory authorities and fallback caches instead of the real Tor network.
 //!
 //! Line format: `authority <name> <v3ident-hex>` and
 //! `fallback <rsa-id-hex> <ed-id-base64> <ip:orport>`. `#` starts a comment.
+//!
+//! This lives in the arti backend crate (not the e2e harness) so that both the
+//! in-process harness path and the out-of-process arti plugin can share one
+//! parser/applier: the plugin reads the descriptor from its environment at
+//! startup and applies it before bootstrap (see the `fungi-arti-plugin`
+//! binary), while the harness applies it inline.
 
+use std::path::Path;
+
+use arti_client::TorClientConfig;
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::config::dir;
 use tor_llcrypto::pk::ed25519::Ed25519Identity;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 
-pub(crate) struct Authority {
-    pub(crate) name: String,
-    pub(crate) v3ident: String,
+/// A single directory authority: a name (validated but unused by arti's parallel
+/// identity vectors) and its v3 identity in hex.
+#[derive(Debug)]
+struct Authority {
+    name: String,
+    v3ident: String,
 }
 
-pub(crate) struct Fallback {
-    pub(crate) rsa: String,
-    pub(crate) ed: String,
-    pub(crate) orport: String,
+/// A single fallback directory cache: RSA + ed25519 identities and its ORPort.
+#[derive(Debug)]
+struct Fallback {
+    rsa: String,
+    ed: String,
+    orport: String,
 }
 
-pub(crate) struct PrivateNet {
-    pub(crate) authorities: Vec<Authority>,
-    pub(crate) fallbacks: Vec<Fallback>,
+/// A parsed private-network descriptor: the authorities and fallback caches a
+/// peer should trust instead of the public Tor directory.
+#[derive(Debug)]
+pub struct PrivateNet {
+    authorities: Vec<Authority>,
+    fallbacks: Vec<Fallback>,
 }
 
 impl PrivateNet {
-    pub(crate) fn parse(text: &str) -> Result<PrivateNet, String> {
+    /// Parse a descriptor from its text form. Returns a human-readable error
+    /// naming the offending line on malformed input.
+    pub fn parse(text: &str) -> Result<PrivateNet, String> {
         let mut authorities = Vec::new();
         let mut fallbacks = Vec::new();
         for (n, line) in text.lines().enumerate() {
@@ -67,7 +86,7 @@ impl PrivateNet {
 
     /// Apply onto arti's config builder: custom authorities + fallbacks and
     /// testing-network directory tolerances.
-    pub(crate) fn apply(&self, b: &mut TorClientConfigBuilder) -> Result<(), String> {
+    pub fn apply(&self, b: &mut TorClientConfigBuilder) -> Result<(), String> {
         let mut authorities = dir::AuthorityContacts::builder();
         for a in &self.authorities {
             // The name is parsed and validated but unused in the apply step.
@@ -106,7 +125,44 @@ impl PrivateNet {
         b.directory_tolerance()
             .post_valid_tolerance(std::time::Duration::from_secs(300));
 
+        // arti has no `TestingTorNetwork`, so — like that C-tor directive does
+        // for the daemons — relax the distinct-subnet path rule for this test
+        // network, whose nodes all share one subnet. Scoped to the private-net
+        // config only: the public-network path (`tor_config`) keeps the rule on.
+        b.path_rules()
+            .ipv4_subnet_family_prefix(32)
+            .ipv6_subnet_family_prefix(128);
+
+        // The VM test network is tiny and CPU-starved — many VMs share the CI
+        // runner's few cores — so hidden-service rendezvous circuits build
+        // slowly and the defaults (60s request timeout, ~6 attempts) give up
+        // before one completes. Grant far more time and attempts so a slow
+        // circuit still succeeds. Private-net scoped, like the relaxations above.
+        b.circuit_timing()
+            .request_timeout(std::time::Duration::from_secs(240))
+            .hs_desc_fetch_attempts(32)
+            .hs_intro_rend_attempts(32)
+            // The service rotates intro points under the churny net, so a
+            // cached descriptor goes stale and every INTRODUCE is rejected
+            // NOT_RECOGNIZED. arti refetches on that NACK, but the default
+            // 15-minute requery interval makes it reuse the stale cache; drop
+            // it so arti pulls a fresh descriptor with the current intro points.
+            .hs_dir_requery_interval(std::time::Duration::from_secs(5));
+
         Ok(())
+    }
+
+    /// Build a ready-to-bootstrap [`TorClientConfig`] rooted at `state_dir` /
+    /// `cache_dir` with this private network applied. Pair with
+    /// [`ArtiTransport::bootstrap_with`](crate::ArtiTransport::bootstrap_with).
+    pub fn build_config(
+        &self,
+        state_dir: &Path,
+        cache_dir: &Path,
+    ) -> Result<TorClientConfig, String> {
+        let mut b = TorClientConfigBuilder::from_directories(state_dir, cache_dir);
+        self.apply(&mut b)?;
+        b.build().map_err(|e| e.to_string())
     }
 }
 
@@ -145,8 +201,8 @@ fallback 27102BC123E7AF1D4741AE047E160C91ADC76B21 xGYRXQ2b1SDpLoNjKilDNzrqAX2XCE
     }
 
     /// The parsed net produces a valid in-memory config that builds successfully.
-    /// This test constructs a full config builder with state/cache directories and
-    /// calls build() to validate runtime config construction (no network access).
+    /// This constructs a full config with state/cache directories and calls
+    /// `build_config` to validate runtime config construction (no network access).
     #[test]
     fn built_config_validates() {
         use std::env;
@@ -157,18 +213,16 @@ fallback 27102BC123E7AF1D4741AE047E160C91ADC76B21 xGYRXQ2b1SDpLoNjKilDNzrqAX2XCE
         // Create temporary state and cache directories unique to this test run.
         let pid = process::id();
         let temp_base = env::temp_dir();
-        let temp_state = temp_base.join(format!("fungi-e2e-test-state-{}", pid));
-        let temp_cache = temp_base.join(format!("fungi-e2e-test-cache-{}", pid));
+        let temp_state = temp_base.join(format!("fungi-arti-test-state-{}", pid));
+        let temp_cache = temp_base.join(format!("fungi-arti-test-cache-{}", pid));
 
         std::fs::create_dir_all(&temp_state).expect("failed to create temp state dir");
         std::fs::create_dir_all(&temp_cache).expect("failed to create temp cache dir");
 
-        let mut b = TorClientConfigBuilder::from_directories(&temp_state, &temp_cache);
-        net.apply(&mut b).unwrap();
-
-        // The build() call validates all config constraints in-memory.
-        // This ensures authorities + fallbacks are consistent per arti's validation.
-        b.build().expect("private-net config should build");
+        // `build_config` validates all config constraints in-memory: this
+        // ensures authorities + fallbacks are consistent per arti's validation.
+        net.build_config(&temp_state, &temp_cache)
+            .expect("private-net config should build");
 
         // Clean up temporary directories.
         let _ = std::fs::remove_dir_all(&temp_state);

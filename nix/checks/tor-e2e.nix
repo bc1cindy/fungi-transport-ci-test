@@ -13,6 +13,11 @@
       {
       tor-e2e = pkgs.testers.runNixOSTest {
         name = "fungi-tor-e2e";
+        # The shared-random commit+reveal cycle needs ~55 min at 1-minute
+        # voting before both SRVs are published (the alignment the onion dial
+        # depends on); the default 3600s global timeout kills the run before
+        # the dial. Give the whole test script room to finish.
+        globalTimeout = 7200;
         nodes = let
           fingerprints = import ../tor-test-net/fingerprints.nix;
           torrc = import ../tor-test-net/torrc.nix { inherit fingerprints; };
@@ -20,8 +25,16 @@
           mkDa = i: { ... }: {
             networking.interfaces.eth1.ipv4.addresses = [{ address = builtins.elemAt daIps (i - 1); prefixLength = 24; }];
             networking.firewall.enable = false;
+            # A test-net tor node is light; cap RAM so the larger relay set fits
+            # the 16 GB runner.
+            virtualisation.memorySize = 512;
             services.tor = {
               enable = true;
+              # relay.enable is required or the module force-clears ORPort/DirPort
+              # from settings (its guard against accidentally relaying); an
+              # authority is a relay that also votes, so role = "relay".
+              relay.enable = true;
+              relay.role = "relay";
               settings = torrc.daSettings {
                 inherit daIps;
                 ip = builtins.elemAt daIps (i - 1);
@@ -43,8 +56,16 @@
           mkRelay = i: { ... }: {
             networking.interfaces.eth1.ipv4.addresses = [{ address = "192.168.1.2${toString i}"; prefixLength = 24; }];
             networking.firewall.enable = false;
+            # Relays build the onion rendezvous circuits; 512 MB with no swap
+            # starved tor and it dropped most circuits. 1 GB keeps them reliable
+            # (3x512 DA + 6x1024 relay + 2x1024 peer = ~9.7 GB, fits the runner).
+            virtualisation.memorySize = 1024;
             services.tor = {
               enable = true;
+              # Same as the authorities: without relay.enable the module
+              # force-clears the ORPort, so the relay would never relay.
+              relay.enable = true;
+              relay.role = "relay";
               settings = torrc.relaySettings {
                 inherit daIps;
                 ip = "192.168.1.2${toString i}";
@@ -54,7 +75,11 @@
           };
         in {
           da1 = mkDa 1; da2 = mkDa 2; da3 = mkDa 3;
+          # Onion services need path diversity: the dax_dev reference net uses
+          # ~8 relays. Six mid/guard relays give the client and hidden-service
+          # rendezvous circuits enough distinct nodes to form (3 relays could not).
           relay1 = mkRelay 1; relay2 = mkRelay 2; relay3 = mkRelay 3;
+          relay4 = mkRelay 4; relay5 = mkRelay 5; relay6 = mkRelay 6;
           peer_socks = { ... }: {
             networking.interfaces.eth1.ipv4.addresses = [{ address = "192.168.1.31"; prefixLength = 24; }];
             networking.firewall.enable = false;
@@ -67,7 +92,12 @@
           };
         };
         testScript = ''
-          e2e = "${self'.packages.fungi-transport-e2e}/bin/fungi-transport-e2e"
+          e2e = "${self'.packages.harness}/bin/harness"
+          # The harness drives each backend as a capnp PLUGIN subprocess: it
+          # spawns these binaries and speaks the plugin protocol over their
+          # stdio, rather than building the backend in-process.
+          socks5h_plugin = "${self'.packages.fungi-socks5h-plugin}/bin/fungi-socks5h-plugin"
+          arti_plugin = "${self'.packages.fungi-arti-plugin}/bin/fungi-arti-plugin"
 
           start_all()
 
@@ -76,12 +106,26 @@
               da.wait_for_unit("tor.service")
           da1.wait_until_succeeds("curl -s http://192.168.1.11:9030/tor/status-vote/current/consensus >/dev/null", timeout=300)
 
-          # Phase 2: relays join; consensus lists >=5 routers.
-          for r in [relay1, relay2, relay3]:
+          # Phase 2: relays join; consensus lists the 3 DAs + 6 relays (>=8, so
+          # one slow node does not fail the gate).
+          for r in [relay1, relay2, relay3, relay4, relay5, relay6]:
               r.wait_for_unit("tor.service")
           da1.wait_until_succeeds(
-              "test $(curl -s http://192.168.1.11:9030/tor/status-vote/current/consensus | grep -c '^r ') -ge 5",
+              "test $(curl -s http://192.168.1.11:9030/tor/status-vote/current/consensus | grep -c '^r ') -ge 8",
               timeout=600,
+          )
+
+          # Both shared-random values (previous AND current) must exist before
+          # onion work. With hsdir_interval aligned to the SRV period, the time
+          # period boundary sits mid-SRV-period, so the client needs the
+          # previous SRV for part of the period; until both are published, one
+          # side falls back to the disaster SRV and arti/C-tor pick different
+          # HSDirs (cross-impl 404). The previous value appears after two full
+          # commit+reveal runs (~48 voting rounds ~= 48 min at 1-minute voting).
+          da1.wait_until_succeeds(
+              "curl -s http://192.168.1.11:9030/tor/status-vote/current/consensus "
+              "| grep -qE 'shared-rand-previous-value [1-9]'",
+              timeout=3600,
           )
 
           # Compose the arti private-net file from runtime relay identities.
@@ -108,31 +152,40 @@
           peer_socks.wait_for_unit("tor.service")
           peer_socks.wait_until_succeeds("nc -z 127.0.0.1 9051", timeout=120)
           peer_socks.succeed(
-              f"({e2e} listen --backend socks5h --virt-port 9735 > /tmp/listen.log 2>/tmp/listen.err; echo $? > /tmp/listen.code) &"
+              f"({e2e} listen --plugin {socks5h_plugin} --virt-port 9735 > /tmp/listen.log 2>/tmp/listen.err; echo $? > /tmp/listen.code) </dev/null >/dev/null 2>&1 &"
           )
           peer_socks.wait_until_succeeds("grep -q READY /tmp/listen.log", timeout=300)
           onion = peer_socks.succeed("grep ONION= /tmp/listen.log").strip().split("=", 1)[1]
+
+          # Let the onion service establish its introduction points, upload its
+          # descriptor, and the small CPU-starved net settle before the dialer
+          # stresses it — otherwise the service can lose its descriptor mid-run.
+          peer_socks.sleep(90)
+
           # wait_until_succeeds retries the whole dial: absorbs the onion-descriptor
           # publication race (spec: "with retries on failure").
           peer_arti.wait_until_succeeds(
-              f"{e2e} dial --backend arti --private-net /tmp/private-net --state-dir /tmp/arti-dial {onion}",
+              f"{e2e} dial --plugin {arti_plugin} --private-net /tmp/private-net --state-dir /tmp/arti-dial {onion}",
               timeout=900,
           )
           peer_socks.wait_until_succeeds(
               "test -f /tmp/listen.code && test $(cat /tmp/listen.code) = 0 || { cat /tmp/listen.err >&2; exit 1; }",
-              timeout=120,
+              timeout=300,
           )
 
           # Phase 4: arti listens, SOCKS5h dials.
           peer_arti.succeed(
-              f"({e2e} listen --backend arti --private-net /tmp/private-net --state-dir /tmp/arti-listen --virt-port 9735 > /tmp/listen.log 2>/tmp/listen.err; echo $? > /tmp/listen.code) &"
+              f"({e2e} listen --plugin {arti_plugin} --private-net /tmp/private-net --state-dir /tmp/arti-listen --virt-port 9735 > /tmp/listen.log 2>/tmp/listen.err; echo $? > /tmp/listen.code) </dev/null >/dev/null 2>&1 &"
           )
           peer_arti.wait_until_succeeds("grep -q READY /tmp/listen.log", timeout=600)
           onion2 = peer_arti.succeed("grep ONION= /tmp/listen.log").strip().split("=", 1)[1]
-          peer_socks.wait_until_succeeds(f"{e2e} dial --backend socks5h {onion2}", timeout=900)
+          # Same settling as Phase 3: let the arti onion service publish and the
+          # net stabilize before socks5h dials it.
+          peer_arti.sleep(90)
+          peer_socks.wait_until_succeeds(f"{e2e} dial --plugin {socks5h_plugin} {onion2}", timeout=900)
           peer_arti.wait_until_succeeds(
               "test -f /tmp/listen.code && test $(cat /tmp/listen.code) = 0 || { cat /tmp/listen.err >&2; exit 1; }",
-              timeout=120,
+              timeout=300,
           )
         '';
       };

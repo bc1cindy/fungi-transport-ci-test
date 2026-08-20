@@ -10,7 +10,10 @@ workspace = true
 [dependencies]
 capnp = "0.21"
 capnp-rpc = "0.21"
-tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "io-std", "net", "process"] }
+# `rt-multi-thread`/`time` are for the `harness` binary (the VM test driver):
+# a multi-thread runtime for `#[tokio::main]` and `timeout` for its step
+# bounds. The library itself needs only the current-thread pieces.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util", "io-std", "net", "process", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 fungi-transport = { path = "../fungi-transport" }

@@ -22,8 +22,10 @@
 mod connector;
 mod error;
 mod listener;
+mod private_net;
 mod transport;
 
 pub use connector::ArtiConnector;
 pub use listener::ArtiListener;
+pub use private_net::PrivateNet;
 pub use transport::{ArtiConfig, ArtiTransport};
