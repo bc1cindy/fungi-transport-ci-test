@@ -22,7 +22,19 @@ fn wire() -> CapnpTransport<MemAddr> {
         ..MemConfig::default()
     };
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    serve_plugin(server_io, MemTransport::new(cfg));
+    // `serve_plugin` is `!Send`, so run it on its own `current_thread` runtime +
+    // `LocalSet`; the thread lives until the duplex closes and is detached here.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("building the server runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let (reader, writer) = tokio::io::split(server_io);
+            serve_plugin(MemTransport::new(cfg), reader, writer).await;
+        });
+    });
     CapnpTransport::connect(client_io)
 }
 

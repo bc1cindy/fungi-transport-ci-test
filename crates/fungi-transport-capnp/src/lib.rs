@@ -31,6 +31,14 @@
 //! The server end is provided by [`serve_loopback`] and [`serve_backend`] (a
 //! single [`Channel`] backend, from the Channel-only phase) and [`serve_plugin`]
 //! (an arbitrary [`Transport`] backend exposed as the whole capnp graph).
+//!
+//! A plugin can run either in-process — over an in-memory duplex, driven by
+//! [`serve_plugin`] on a background thread — or as a real child process:
+//! [`connect_plugin`] spawns a program, speaks capnp-rpc over its stdin/stdout,
+//! and returns the same [`CapnpTransport`], while the child runs
+//! [`serve_plugin`] over its own stdio. Both paths share the one client actor
+//! loop; only the transport source differs (an in-memory server vs a
+//! bootstrapped remote `Plugin`).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -173,16 +181,17 @@ impl Registry {
 
 /// Build the `current_thread` runtime + `LocalSet` and run the client actor to
 /// completion on this thread.
-fn run_client_actor<Io>(io: Io, boot: Bootstrap, rx: mpsc::Receiver<Command>)
+fn run_client_actor<R, W>(reader: R, writer: W, boot: Bootstrap, rx: mpsc::Receiver<Command>)
 where
-    Io: AsyncRead + AsyncWrite + Unpin + 'static,
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
 {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("building the capnp client runtime");
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, client_actor(io, boot, rx));
+    local.block_on(&rt, client_actor(reader, writer, boot, rx));
 }
 
 /// The client actor: bootstrap the remote capability, then translate each
@@ -194,11 +203,11 @@ where
 /// last client handle drops, `rx` closes, the loop ends, and returning drops
 /// the `LocalSet` — tearing down the RPC system and any parked task, so a drop
 /// even mid-`recv` cleanly closes the connection.
-async fn client_actor<Io>(io: Io, boot: Bootstrap, mut rx: mpsc::Receiver<Command>)
+async fn client_actor<R, W>(reader: R, writer: W, boot: Bootstrap, mut rx: mpsc::Receiver<Command>)
 where
-    Io: AsyncRead + AsyncWrite + Unpin + 'static,
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
 {
-    let (reader, writer) = tokio::io::split(io);
     let network = twoparty::VatNetwork::new(
         reader.compat(),
         writer.compat_write(),
@@ -568,12 +577,84 @@ where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (tx, rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
-        std::thread::spawn(move || run_client_actor(io, Bootstrap::Plugin, rx));
+        let (reader, writer) = tokio::io::split(io);
+        std::thread::spawn(move || run_client_actor(reader, writer, Bootstrap::Plugin, rx));
         Self {
             tx,
             transport_id: BOOTSTRAP_ID,
             _addr: PhantomData,
         }
+    }
+}
+
+/// Spawn a plugin child process and connect a [`CapnpTransport`] to it over the
+/// child's stdin/stdout.
+///
+/// `command` is the program to run; its stdin and stdout are overridden with
+/// pipes to carry capnp-rpc, and its stderr is inherited so a plugin panic is
+/// visible on the parent's stderr. The child speaks the server side of the
+/// plugin protocol (see [`serve_plugin`]).
+///
+/// The child is spawned inside the connection's actor thread — the same
+/// `current_thread` runtime that drives the RPC system — because a child's
+/// piped stdin/stdout are bound to the runtime that creates them and cannot be
+/// moved to another. The returned handle is therefore usable immediately; the
+/// plugin's `transport()` is pipelined and resolved by the first factory call.
+///
+/// A child that cannot be spawned, or that exits before the capnp handshake
+/// completes, surfaces as [`ConnectError::Unreachable`] on the first transport
+/// operation (never a hang or a panic). A mid-session disconnect maps to a
+/// closed channel, as with the in-process path.
+pub fn connect_plugin<A>(mut command: tokio::process::Command) -> CapnpTransport<A>
+where
+    A: FromStr + Display + Send + Sync + 'static,
+{
+    let (tx, rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("building the capnp client runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            command
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                // The actor loop reaps the child deterministically on its normal
+                // return (start_kill + wait below). kill_on_drop is the fallback
+                // for the one path that skips it: an unexpected panic unwinding
+                // this thread after spawn — the Child's drop then still kills the
+                // plugin instead of orphaning it.
+                .kill_on_drop(true);
+            // A spawn failure drops `rx`; the first factory call then fails its
+            // `tx.send` and reports `Unreachable`. The error is logged (not
+            // swallowed silently) so a real backend launch failure is
+            // debuggable on the parent's stderr.
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    eprintln!("connect_plugin: failed to spawn plugin process: {err}");
+                    return;
+                }
+            };
+            let reader = child.stdout.take().expect("child stdout is piped");
+            let writer = child.stdin.take().expect("child stdin is piped");
+
+            // `writer` (the child's stdin) is moved into the actor loop and
+            // dropped when it returns, delivering stdin-EOF to the plugin. The
+            // `child` handle is kept alive past the loop so it can then be reaped
+            // deterministically inside this still-live runtime: `start_kill` +
+            // `wait` guarantee no orphan even if the plugin ignores EOF.
+            client_actor(reader, writer, Bootstrap::Plugin, rx).await;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        });
+    });
+    CapnpTransport {
+        tx,
+        transport_id: BOOTSTRAP_ID,
+        _addr: PhantomData,
     }
 }
 
@@ -747,7 +828,8 @@ impl CapnpChannel {
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (tx, rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
-        std::thread::spawn(move || run_client_actor(io, Bootstrap::Channel, rx));
+        let (reader, writer) = tokio::io::split(io);
+        std::thread::spawn(move || run_client_actor(reader, writer, Bootstrap::Channel, rx));
         Self {
             tx,
             channel_id: BOOTSTRAP_ID,
@@ -1119,20 +1201,35 @@ where
     serve(io, move || new_channel_client(backend).client)
 }
 
-/// Serve the whole transport graph over `io` backed by an arbitrary
-/// [`Transport`], exposing a `Plugin` bootstrap. Its addresses must round-trip
-/// through capnp text ([`FromStr`] + [`Display`]). Pair with a
-/// [`CapnpTransport::connect`] on the other end of `io`.
-pub fn serve_plugin<Io, T>(io: Io, backend: T) -> std::thread::JoinHandle<()>
+/// Serve the whole transport graph over `reader`/`writer` backed by an
+/// arbitrary [`Transport`], exposing a `Plugin` bootstrap, and run until the
+/// connection closes. Its addresses must round-trip through capnp text
+/// ([`FromStr`] + [`Display`]).
+///
+/// This is the plugin process's entry point: a plugin binary builds a
+/// `current_thread` runtime plus a [`LocalSet`](tokio::task::LocalSet) and runs
+/// this over its own stdin (`reader`) and stdout (`writer`). Pair it with a
+/// [`connect_plugin`] (across a real process boundary) or a
+/// [`CapnpTransport::connect`] (in-process) on the other end.
+///
+/// This future is `!Send` — the capnp machinery is `Rc`-based — so it must be
+/// driven on a `current_thread` runtime under a `LocalSet`.
+pub async fn serve_plugin<R, W, T>(backend: T, reader: R, writer: W)
 where
-    Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
     T: Transport + 'static,
     T::Addr: FromStr + Display,
 {
-    serve(io, move || {
-        let client: plugin::Client = capnp_rpc::new_client(PluginServer {
-            backend: Rc::new(backend),
-        });
-        client.client
-    })
+    let network = twoparty::VatNetwork::new(
+        reader.compat(),
+        writer.compat_write(),
+        Side::Server,
+        Default::default(),
+    );
+    let client: plugin::Client = capnp_rpc::new_client(PluginServer {
+        backend: Rc::new(backend),
+    });
+    let rpc_system = RpcSystem::new(Box::new(network), Some(client.client));
+    let _ = rpc_system.await;
 }

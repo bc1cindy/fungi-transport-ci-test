@@ -10,7 +10,7 @@ workspace = true
 [dependencies]
 capnp = "0.21"
 capnp-rpc = "0.21"
-tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "io-std", "net", "process"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
 fungi-transport = { path = "../fungi-transport" }
