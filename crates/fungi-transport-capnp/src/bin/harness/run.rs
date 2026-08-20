@@ -133,32 +133,40 @@ where
 /// bounded by the wider [`ACCEPT_TIMEOUT`] so the listener outlives the dialer's
 /// retry budget in the VM test; the data phase is bounded by [`STEP_TIMEOUT`].
 ///
-/// Backend configuration reaches the plugin through its environment, set here
-/// from the harness's generic flags. Each backend reads only the env it needs
-/// and ignores the rest:
-///
-/// - `FUNGI_STATE_DIR`/`FUNGI_CACHE_DIR` (from `--state-dir`, when given): arti
-///   reads these for its persistent state and directory cache; socks5h ignores
-///   them.
-/// - `FUNGI_PRIVATE_NET` (from `--private-net`, when given): arti applies the
-///   private-net descriptor before it bootstraps, so the private test network is
-///   installed at plugin startup — this is what replaces the capnp
-///   `TestFixtures` private-net lifecycle for the plugin topology. socks5h
-///   ignores it.
+/// Backend configuration is delivered two ways, and each backend uses only what
+/// it needs. Directory config goes through the environment: `--state-dir` sets
+/// `FUNGI_STATE_DIR`/`FUNGI_CACHE_DIR` for arti's persistent state and cache
+/// (socks5h ignores them). The private test network goes through the plugin's
+/// `TestFixtures.configurePrivateNet` capability instead — `--private-net` is
+/// read here and installed before the transport is first driven, since arti must
+/// fix its authorities before its one bootstrap; socks5h treats it as a no-op.
 pub(crate) async fn run(cli: Cli) -> Result<(), String> {
     use fungi_transport::OnionAddr;
     use fungi_transport_capnp::{CapnpTransport, connect_plugin};
 
     let mut command = tokio::process::Command::new(&cli.plugin);
+    // The harness only ever runs backends in test/VM contexts, whose state dirs
+    // (e.g. under a world-writable /tmp) arti's fs-mistrust guard would reject.
+    // Relax it for the spawned plugin; a plugin run outside the harness keeps
+    // the guard on.
+    command.env("FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS", "1");
     if let Some(dir) = &cli.state_dir {
         command.env("FUNGI_STATE_DIR", dir.join("state"));
         command.env("FUNGI_CACHE_DIR", dir.join("cache"));
     }
-    if let Some(path) = &cli.private_net {
-        command.env("FUNGI_PRIVATE_NET", path);
-    }
 
     let transport: CapnpTransport<OnionAddr> = connect_plugin(command);
+    // Install the private test network through the fixtures tier before the
+    // first factory call, since a backend may fix its network only once.
+    if let Some(path) = &cli.private_net {
+        let net_file = tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("reading --private-net {}: {e}", path.display()))?;
+        transport
+            .configure_private_net(&net_file)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     match &cli.cmd {
         Cmd::Listen { virt_port } => {
             run_listen(

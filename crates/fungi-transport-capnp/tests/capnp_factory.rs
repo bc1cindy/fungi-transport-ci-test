@@ -4,10 +4,12 @@
 //! `connector`/`listen`/`connect`/`accept`/`send`/`recv` all traverse capnp on
 //! every hop, and the factory futures are shown `Send` at compile time.
 
+use std::sync::{Arc, Mutex};
+
 use fungi_transport::mem::{MemAddr, MemConfig, MemTransport};
 use fungi_transport::testkit;
 use fungi_transport::{Channel, Connector, ListenParams, Listener, Transport};
-use fungi_transport_capnp::{CapnpTransport, serve_plugin};
+use fungi_transport_capnp::{CapnpTransport, PluginFixtures, serve_plugin, serve_plugin_with};
 
 /// Compile-time proof that a value is `Send`.
 fn assert_send<T: Send>(_: &T) {}
@@ -80,4 +82,60 @@ async fn connect_use_drop_reconnect_over_capnp() {
     let (listener, addr) = _transport.listen(ListenParams::new(1)).await.unwrap();
 
     testkit::connect_use_drop_reconnect(connector, listener, &addr).await;
+}
+
+/// FIXTURES: the test-only tier, distinct from the primary transport API. A
+/// `configure_private_net` on the client reaches the backend's `PluginFixtures`
+/// impl across capnp — the same wire path arti's plugin uses to install a
+/// private network before its bootstrap. Proven deterministically in-process.
+#[tokio::test]
+async fn configure_private_net_reaches_the_fixtures_over_capnp() {
+    /// Records the last configured descriptor, so the test can assert the bytes
+    /// crossed the capnp boundary intact.
+    struct Recording {
+        got: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+    impl PluginFixtures for Recording {
+        fn configure_private_net(&self, net_file: &[u8]) -> Result<(), String> {
+            *self.got.lock().unwrap() = Some(net_file.to_vec());
+            Ok(())
+        }
+    }
+
+    let got = Arc::new(Mutex::new(None));
+    let got_server = got.clone();
+    let cfg = MemConfig {
+        capacity: Some(8),
+        ..MemConfig::default()
+    };
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("building the server runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let (reader, writer) = tokio::io::split(server_io);
+            serve_plugin_with(
+                MemTransport::new(cfg),
+                Recording { got: got_server },
+                reader,
+                writer,
+            )
+            .await;
+        });
+    });
+
+    let transport: CapnpTransport<MemAddr> = CapnpTransport::connect(client_io);
+    // The call resolves only after the server ran the fixture, so the record is
+    // in place by the time this returns.
+    transport
+        .configure_private_net(b"private-net-bytes")
+        .await
+        .unwrap();
+    assert_eq!(
+        got.lock().unwrap().as_deref(),
+        Some(&b"private-net-bytes"[..])
+    );
 }

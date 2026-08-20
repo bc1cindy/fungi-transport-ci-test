@@ -125,6 +125,13 @@ enum Command {
     /// Drop a stored capability (and any per-channel receive state) so the
     /// remote server tears its object down. Sent by a handle's `Drop`.
     Release { id: u64 },
+    /// `plugin.fixtures().configurePrivateNet(netFile)` — a test-only fixture
+    /// call, distinct from the primary transport API, carried to the plugin's
+    /// `TestFixtures` capability. Only meaningful for a `Plugin` bootstrap.
+    ConfigurePrivateNet {
+        net_file: Vec<u8>,
+        reply: oneshot::Sender<Result<(), ConnectError>>,
+    },
 }
 
 /// What the actor bootstraps from the remote vat and stores at
@@ -219,8 +226,9 @@ where
     let registry = Rc::new(RefCell::new(Registry::new()));
 
     // Kept in scope so the bootstrap plugin capability outlives the pipelined
-    // transport that was derived from it.
-    let _bootstrap_keepalive = match boot {
+    // transport that was derived from it; it is also the capability
+    // `ConfigurePrivateNet` drives its `fixtures()` from.
+    let plugin_cap: Option<plugin::Client> = match boot {
         Bootstrap::Channel => {
             let channel: channel::Client = rpc_system.bootstrap(Side::Server);
             registry.borrow_mut().channels.insert(BOOTSTRAP_ID, channel);
@@ -485,6 +493,27 @@ where
                 reg.channels.remove(&id);
                 reg.recv_states.remove(&id);
             }
+
+            Command::ConfigurePrivateNet { net_file, reply } => {
+                // Fixtures live only behind a `Plugin` bootstrap; a Channel-only
+                // client has no fixtures capability to drive.
+                let Some(plugin) = plugin_cap.clone() else {
+                    let _ = reply.send(Err(ConnectError::Unreachable));
+                    continue;
+                };
+                tokio::task::spawn_local(async move {
+                    let fixtures = plugin.fixtures_request().send().pipeline.get_fixtures();
+                    let mut req = fixtures.configure_private_net_request();
+                    req.get().set_net_file(&net_file);
+                    let result = req
+                        .send()
+                        .promise
+                        .await
+                        .map(|_| ())
+                        .map_err(map_connect_error);
+                    let _ = reply.send(result);
+                });
+            }
         }
     }
 }
@@ -609,6 +638,28 @@ where
             max_msg_len,
             _addr: PhantomData,
         }
+    }
+
+    /// Drive the plugin's `TestFixtures.configurePrivateNet` with `net_file`:
+    /// a test-only hook, separate from the primary transport API, that installs
+    /// a private test network in the plugin before its transport is first used.
+    /// The bytes are opaque here — the backend parses them. A backend that needs
+    /// no such setup treats the call as a no-op. Errors (or a non-plugin peer)
+    /// surface as [`ConnectError`].
+    ///
+    /// Call it before the first `connector`/`listen`, since a backend may fix
+    /// its network only once (arti's authorities must be set before its one
+    /// bootstrap).
+    pub async fn configure_private_net(&self, net_file: &[u8]) -> Result<(), ConnectError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::ConfigurePrivateNet {
+                net_file: net_file.to_vec(),
+                reply,
+            })
+            .await
+            .map_err(|_| ConnectError::Unreachable)?;
+        rx.await.map_err(|_| ConnectError::Unreachable)?
     }
 }
 
@@ -1183,18 +1234,52 @@ where
     }
 }
 
-/// A no-op [`test_fixtures::Server`]. Private-network driving is not needed for
-/// the in-process phase; the bootstrap still exposes the capability so the wire
-/// shape is complete.
-struct NoopFixtures;
+/// Backend-provided test fixtures: the setup/teardown hooks a harness drives
+/// over the plugin's `TestFixtures` capability, kept distinct from the primary
+/// transport API. The bytes handed to [`configure_private_net`] are opaque to
+/// this layer — the backend parses them. A backend that needs no test-time setup
+/// uses [`NoopFixtures`] (the default in [`serve_plugin`]); arti implements this
+/// to install a private test network before its one bootstrap.
+///
+/// [`configure_private_net`]: PluginFixtures::configure_private_net
+pub trait PluginFixtures {
+    /// Install a private-network descriptor before the transport is first used.
+    /// Returns a human-readable message on failure (surfaced as a capnp error).
+    fn configure_private_net(&self, net_file: &[u8]) -> Result<(), String>;
+    /// Tear down any test state. Defaults to a no-op.
+    fn reset(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
 
-impl test_fixtures::Server for NoopFixtures {
+/// A [`PluginFixtures`] that does nothing: the default for backends whose test
+/// network is set up out of band (e.g. socks5h, whose private Tor net is the
+/// system daemon's torrc, or the in-memory backend).
+#[derive(Debug)]
+pub struct NoopFixtures;
+
+impl PluginFixtures for NoopFixtures {
+    fn configure_private_net(&self, _net_file: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Adapts any [`PluginFixtures`] onto the capnp `TestFixtures` server interface.
+struct FixturesServer<F> {
+    fixtures: Rc<F>,
+}
+
+impl<F: PluginFixtures + 'static> test_fixtures::Server for FixturesServer<F> {
     fn configure_private_net(
         &mut self,
-        _params: test_fixtures::ConfigurePrivateNetParams,
+        params: test_fixtures::ConfigurePrivateNetParams,
         _results: test_fixtures::ConfigurePrivateNetResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::ok(())
+        let net_file = pry!(pry!(params.get()).get_net_file()).to_vec();
+        match self.fixtures.configure_private_net(&net_file) {
+            Ok(()) => Promise::ok(()),
+            Err(e) => Promise::err(capnp::Error::failed(e)),
+        }
     }
 
     fn reset(
@@ -1202,17 +1287,21 @@ impl test_fixtures::Server for NoopFixtures {
         _params: test_fixtures::ResetParams,
         _results: test_fixtures::ResetResults,
     ) -> Promise<(), capnp::Error> {
-        Promise::ok(())
+        match self.fixtures.reset() {
+            Ok(()) => Promise::ok(()),
+            Err(e) => Promise::err(capnp::Error::failed(e)),
+        }
     }
 }
 
-/// The capnp [`plugin::Server`] bootstrap: exposes a [`Transport`] backend and
-/// a no-op [`TestFixtures`].
-struct PluginServer<T: Transport> {
+/// The capnp [`plugin::Server`] bootstrap: exposes a [`Transport`] backend
+/// (the primary API) and a [`PluginFixtures`] (the test-only tier).
+struct PluginServer<T: Transport, F> {
     backend: Rc<T>,
+    fixtures: Rc<F>,
 }
 
-impl<T: Transport + 'static> plugin::Server for PluginServer<T>
+impl<T: Transport + 'static, F: PluginFixtures + 'static> plugin::Server for PluginServer<T, F>
 where
     T::Addr: FromStr + Display,
 {
@@ -1233,7 +1322,9 @@ where
         _params: plugin::FixturesParams,
         mut results: plugin::FixturesResults,
     ) -> Promise<(), capnp::Error> {
-        let client: test_fixtures::Client = capnp_rpc::new_client(NoopFixtures);
+        let client: test_fixtures::Client = capnp_rpc::new_client(FixturesServer {
+            fixtures: self.fixtures.clone(),
+        });
         results.get().set_fixtures(client);
         Promise::ok(())
     }
@@ -1314,6 +1405,22 @@ where
     T: Transport + 'static,
     T::Addr: FromStr + Display,
 {
+    serve_plugin_with(backend, NoopFixtures, reader, writer).await
+}
+
+/// Like [`serve_plugin`], but with a backend-provided [`PluginFixtures`] exposed
+/// on the plugin's `TestFixtures` capability. A backend that must set up test
+/// resources before its transport is usable (arti installs a private network
+/// before its one bootstrap) serves a fixtures value that shares state with a
+/// lazily-initialized transport; `serve_plugin` is this with [`NoopFixtures`].
+pub async fn serve_plugin_with<R, W, T, F>(backend: T, fixtures: F, reader: R, writer: W)
+where
+    R: AsyncRead + Unpin + 'static,
+    W: AsyncWrite + Unpin + 'static,
+    T: Transport + 'static,
+    T::Addr: FromStr + Display,
+    F: PluginFixtures + 'static,
+{
     let network = twoparty::VatNetwork::new(
         reader.compat(),
         writer.compat_write(),
@@ -1322,6 +1429,7 @@ where
     );
     let client: plugin::Client = capnp_rpc::new_client(PluginServer {
         backend: Rc::new(backend),
+        fixtures: Rc::new(fixtures),
     });
     let rpc_system = RpcSystem::new(Box::new(network), Some(client.client));
     let _ = rpc_system.await;

@@ -21,11 +21,13 @@
 
 mod connector;
 mod error;
+mod lazy;
 mod listener;
 mod private_net;
 mod transport;
 
 pub use connector::ArtiConnector;
+pub use lazy::{LazyArtiConnector, LazyArtiTransport};
 pub use listener::ArtiListener;
 pub use private_net::PrivateNet;
 pub use transport::{ArtiConfig, ArtiTransport};

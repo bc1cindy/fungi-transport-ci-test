@@ -1,24 +1,22 @@
 //! A capnp plugin process backed by the in-process arti Tor client.
 //!
-//! It bootstraps onto a Tor network and then speaks the server side of the
-//! plugin protocol over its own stdin/stdout, so a harness can drive it through
+//! It speaks the server side of the plugin protocol over its own stdin/stdout,
+//! so a harness can drive it through
 //! [`connect_plugin`](fungi_transport_capnp::connect_plugin). Its configuration
-//! is taken entirely from the environment at startup, defaulting under the
-//! system temp dir:
+//! is taken from the environment at startup, defaulting under the system temp
+//! dir:
 //!
 //! - `FUNGI_STATE_DIR` — arti's persistent state, including onion-service keys
 //!   (identity persists per nickname; a throwaway dir gives an ephemeral
 //!   identity).
 //! - `FUNGI_CACHE_DIR` — arti's network-directory cache.
-//! - `FUNGI_PRIVATE_NET` — optional path to a private-network descriptor
-//!   ([`PrivateNet`](fungi_transport_arti::PrivateNet)). When set, its
-//!   authorities + fallback caches are applied to the config **before**
-//!   bootstrap, so the plugin joins a private test network instead of the public
-//!   Tor directory. Delivering the private net through the environment at
-//!   startup is what replaces the capnp `TestFixtures.configurePrivateNet`
-//!   lifecycle for the plugin topology (the exposed fixtures stay `NoopFixtures`):
-//!   arti's directory authorities must be fixed before the one bootstrap, not
-//!   reconfigured on a live client.
+//!
+//! The private test network is *not* an env var: arti's directory authorities
+//! must be fixed before its single bootstrap, so the transport is bootstrapped
+//! lazily and the harness installs the private net first through the plugin's
+//! `TestFixtures.configurePrivateNet` capability (see [`ArtiFixtures`]). With no
+//! such call — the production path — the first transport operation bootstraps
+//! onto the public Tor network.
 //!
 //! Bootstrap needs a live Tor network, so this binary has no deterministic
 //! test; it is exercised end to end by the NixOS VM suite. What is asserted
@@ -27,8 +25,8 @@
 use std::path::PathBuf;
 
 use fungi_transport::framed::DEFAULT_MAX_MSG_LEN;
-use fungi_transport_arti::{ArtiConfig, ArtiTransport, PrivateNet};
-use fungi_transport_capnp::serve_plugin;
+use fungi_transport_arti::LazyArtiTransport;
+use fungi_transport_capnp::{PluginFixtures, serve_plugin_with};
 
 /// Read a directory path from `var`, falling back to `<temp>/default_leaf`.
 fn env_dir(var: &str, default_leaf: &str) -> PathBuf {
@@ -38,13 +36,26 @@ fn env_dir(var: &str, default_leaf: &str) -> PathBuf {
     }
 }
 
+/// The plugin's test-fixtures tier: forwards `configurePrivateNet` to the lazy
+/// transport, which applies the descriptor before its one bootstrap. Keeping
+/// the `PluginFixtures` impl here (not in the library) leaves the arti library
+/// free of the capnp plugin layer.
+struct ArtiFixtures {
+    transport: LazyArtiTransport,
+}
+
+impl PluginFixtures for ArtiFixtures {
+    fn configure_private_net(&self, net_file: &[u8]) -> Result<(), String> {
+        self.transport.configure_private_net(net_file)
+    }
+}
+
 fn main() {
     let state_dir = env_dir("FUNGI_STATE_DIR", "fungi-arti-state");
     let cache_dir = env_dir("FUNGI_CACHE_DIR", "fungi-arti-cache");
-    let private_net = std::env::var_os("FUNGI_PRIVATE_NET").map(PathBuf::from);
 
-    // capnp-rpc is `!Send`; drive it (and the bootstrap) on a current-thread
-    // runtime under a `LocalSet`, as every plugin server must.
+    // capnp-rpc is `!Send`; drive it (and the deferred bootstrap) on a
+    // current-thread runtime under a `LocalSet`, as every plugin server must.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -55,25 +66,10 @@ fn main() {
         // single provider is in the graph, so make the choice unambiguous.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let transport = match private_net {
-            // Private test network: apply the descriptor's authorities +
-            // fallback caches before the single bootstrap.
-            Some(path) => {
-                let text = std::fs::read_to_string(&path)
-                    .expect("reading the FUNGI_PRIVATE_NET descriptor");
-                let tor_cfg = PrivateNet::parse(&text)
-                    .expect("parsing the private-net descriptor")
-                    .build_config(&state_dir, &cache_dir)
-                    .expect("building the private-net arti config");
-                ArtiTransport::bootstrap_with(tor_cfg, DEFAULT_MAX_MSG_LEN)
-                    .await
-                    .expect("bootstrapping arti onto the private Tor network")
-            }
-            // Stock config: bootstrap onto the public Tor network.
-            None => ArtiTransport::bootstrap(ArtiConfig::new(state_dir, cache_dir))
-                .await
-                .expect("bootstrapping arti onto the Tor network"),
+        let transport = LazyArtiTransport::new(state_dir, cache_dir, DEFAULT_MAX_MSG_LEN);
+        let fixtures = ArtiFixtures {
+            transport: transport.clone(),
         };
-        serve_plugin(transport, tokio::io::stdin(), tokio::io::stdout()).await;
+        serve_plugin_with(transport, fixtures, tokio::io::stdin(), tokio::io::stdout()).await;
     });
 }
