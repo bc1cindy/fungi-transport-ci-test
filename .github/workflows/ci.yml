@@ -1,19 +1,21 @@
 name: CI
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
 jobs:
-  test:
+  # Fast crane checks (nextest, clippy, fmt, doc): every PR and every push,
+  # pinned by flake.lock. Built by name so the slow cross-backend VM test
+  # (a separate check) stays off the PR path.
+  checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      - run: cargo test --doc
-      - run: cargo run -p fungi-transport --example echo
+      - uses: DeterminateSystems/nix-installer-action@v22
+      # TODO: add a nix cache once first-run wall-clock is measured (magic-nix-cache was sunset)
+      - run: |
+          nix build -L \
+            .#checks.x86_64-linux.nextest \
+            .#checks.x86_64-linux.clippy \
+            .#checks.x86_64-linux.fmt \
+            .#checks.x86_64-linux.doc
