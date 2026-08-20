@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use fungi_transport::{Channel, Connector, Listener, OnionAddr};
+use fungi_transport::{Channel, Connector, ListenParams, Listener, OnionAddr, Transport};
 
 /// Bounded wait for every network step: the VM test must fail, not hang.
 pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -131,6 +131,45 @@ pub(crate) fn parse_args(args: Vec<String>) -> Result<Cli, String> {
     })
 }
 
+/// Listen over any backend: publish, accept one peer, echo until it closes.
+/// Establishment awaits are bounded by `STEP_TIMEOUT`; `accept()` by the wider
+/// `ACCEPT_TIMEOUT`.
+pub(crate) async fn run_listen<T>(transport: T, params: ListenParams) -> Result<(), String>
+where
+    T: Transport,
+    T::Addr: std::fmt::Display,
+{
+    let (mut listener, addr) = tokio::time::timeout(STEP_TIMEOUT, transport.listen(params))
+        .await
+        .map_err(|_| "listen timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+    println!("ONION={addr}");
+    println!("READY");
+    let ch = tokio::time::timeout(ACCEPT_TIMEOUT, listener.accept())
+        .await
+        .map_err(|_| "accept timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(STEP_TIMEOUT, echo_one_peer(ch))
+        .await
+        .map_err(|_| "echo/dial phase timed out".to_string())?
+}
+
+/// Dial one peer over any connector: connect, run the message sequence.
+pub(crate) async fn run_dial<Co>(connector: Co, target: &Co::Addr) -> Result<(), String>
+where
+    Co: Connector,
+{
+    let ch = tokio::time::timeout(STEP_TIMEOUT, connector.connect(target))
+        .await
+        .map_err(|_| "connect timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(STEP_TIMEOUT, dial_sequence(ch))
+        .await
+        .map_err(|_| "echo/dial phase timed out".to_string())??;
+    println!("OK");
+    Ok(())
+}
+
 /// Run the parsed command over the chosen backend. Establishment awaits
 /// (bind/listen/connect/bootstrap) are bounded by [`STEP_TIMEOUT`];
 /// `accept()` is bounded by the wider [`ACCEPT_TIMEOUT`] so the listener
@@ -138,71 +177,32 @@ pub(crate) fn parse_args(args: Vec<String>) -> Result<Cli, String> {
 /// (`echo_one_peer`/`dial_sequence`) is bounded by [`STEP_TIMEOUT`] at
 /// each call site below.
 pub(crate) async fn run(cli: Cli) -> Result<(), String> {
-    match (&cli.backend, &cli.cmd) {
-        (BackendKind::Socks5h, Cmd::Listen { virt_port }) => {
-            use fungi_transport_socks5h::{TorConfig, TorListener};
-            let cfg = TorConfig::default();
-            let mut l = tokio::time::timeout(STEP_TIMEOUT, TorListener::bind(&cfg, *virt_port))
-                .await
-                .map_err(|_| "bind timed out".to_string())?
-                .map_err(|e| e.to_string())?;
-            println!("ONION={}", l.onion_addr());
-            println!("READY");
-            let ch = tokio::time::timeout(ACCEPT_TIMEOUT, l.accept())
-                .await
-                .map_err(|_| "accept timed out".to_string())?
-                .map_err(|e| e.to_string())?;
-            tokio::time::timeout(STEP_TIMEOUT, echo_one_peer(ch))
-                .await
-                .map_err(|_| "echo/dial phase timed out".to_string())?
-        }
-        (BackendKind::Socks5h, Cmd::Dial { target }) => {
-            use fungi_transport_socks5h::{TorConfig, TorConnector};
-            let c = TorConnector::new(TorConfig::default());
-            let ch = tokio::time::timeout(STEP_TIMEOUT, c.connect(target))
-                .await
-                .map_err(|_| "connect timed out".to_string())?
-                .map_err(|e| e.to_string())?;
-            tokio::time::timeout(STEP_TIMEOUT, dial_sequence(ch))
-                .await
-                .map_err(|_| "echo/dial phase timed out".to_string())??;
-            println!("OK");
-            Ok(())
-        }
-        (BackendKind::Arti, cmd) => {
-            let transport = arti_transport(&cli).await?;
-            match cmd {
+    match cli.backend {
+        BackendKind::Socks5h => {
+            use fungi_transport_socks5h::{TorConfig, TorTransport};
+            let transport = TorTransport::new(TorConfig::default());
+            match &cli.cmd {
                 Cmd::Listen { virt_port } => {
-                    // Alphanumeric nickname: arti's HsNickname parse is strict.
-                    let mut l = tokio::time::timeout(
-                        STEP_TIMEOUT,
-                        transport.listen("fungie2e", *virt_port),
+                    run_listen(
+                        transport,
+                        ListenParams::new(*virt_port).with_nickname("fungie2e"),
                     )
                     .await
-                    .map_err(|_| "listen timed out".to_string())?
-                    .map_err(|e| e.to_string())?;
-                    println!("ONION={}", l.onion_addr());
-                    println!("READY");
-                    let ch = tokio::time::timeout(ACCEPT_TIMEOUT, l.accept())
-                        .await
-                        .map_err(|_| "accept timed out".to_string())?
-                        .map_err(|e| e.to_string())?;
-                    tokio::time::timeout(STEP_TIMEOUT, echo_one_peer(ch))
-                        .await
-                        .map_err(|_| "echo/dial phase timed out".to_string())?
                 }
-                Cmd::Dial { target } => {
-                    let c = transport.connector();
-                    let ch = tokio::time::timeout(STEP_TIMEOUT, c.connect(target))
-                        .await
-                        .map_err(|_| "connect timed out".to_string())?
-                        .map_err(|e| e.to_string())?;
-                    tokio::time::timeout(STEP_TIMEOUT, dial_sequence(ch))
-                        .await
-                        .map_err(|_| "echo/dial phase timed out".to_string())??;
-                    println!("OK");
-                    Ok(())
+                Cmd::Dial { target } => run_dial(transport.connector(), target).await,
+            }
+        }
+        BackendKind::Arti => {
+            let transport = arti_transport(&cli).await?;
+            match &cli.cmd {
+                Cmd::Listen { virt_port } => {
+                    run_listen(
+                        transport,
+                        ListenParams::new(*virt_port).with_nickname("fungie2e"),
+                    )
+                    .await
                 }
+                Cmd::Dial { target } => run_dial(transport.connector(), target).await,
             }
         }
     }
@@ -281,6 +281,22 @@ mod tests {
         });
         assert!(dial_sequence(a).await.is_err());
         broken.abort();
+    }
+
+    #[tokio::test]
+    async fn run_listen_and_run_dial_roundtrip_over_mem() {
+        use fungi_transport::mem::{MemAddr, MemConfig, MemTransport};
+        use fungi_transport::{ListenParams, Transport};
+        let transport = MemTransport::new(MemConfig {
+            capacity: Some(16),
+            ..MemConfig::default()
+        });
+        let connector = transport.connector();
+        let listen = tokio::spawn(run_listen(transport, ListenParams::new(1)));
+        // The dialer connects, runs the sequence, then drops — the echo side sees
+        // the close and run_listen returns Ok.
+        run_dial(connector, &MemAddr).await.unwrap();
+        listen.await.unwrap().unwrap();
     }
 
     #[test]
