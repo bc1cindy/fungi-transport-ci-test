@@ -25,6 +25,8 @@ use tokio::net::TcpStream;
 
 use fungi_transport::ConnectError;
 use fungi_transport::Connector;
+use fungi_transport::ListenParams;
+use fungi_transport::Transport;
 use fungi_transport::framed::{DEFAULT_MAX_MSG_LEN, FramedChannel};
 
 /// Knobs for the tor-daemon backend. Defaults match a stock daemon on
@@ -80,6 +82,44 @@ impl Connector for TorConnector {
         async move {
             let stream = socks5::connect(socks_addr, &host, port).await?;
             Ok(FramedChannel::new(stream, max))
+        }
+    }
+}
+
+/// A [`Transport`] over a tor daemon: SOCKS5h connectors and ephemeral onion
+/// listeners.
+#[derive(Debug, Clone)]
+pub struct TorTransport {
+    cfg: TorConfig,
+}
+
+impl TorTransport {
+    /// A transport talking to the daemon described by `cfg`.
+    pub fn new(cfg: TorConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl Transport for TorTransport {
+    type Addr = OnionAddr;
+    type Connector = TorConnector;
+    type Listener = TorListener;
+
+    fn connector(&self) -> TorConnector {
+        TorConnector::new(self.cfg.clone())
+    }
+
+    fn listen(
+        &self,
+        params: ListenParams,
+    ) -> impl std::future::Future<Output = Result<(TorListener, OnionAddr), ConnectError>> + Send
+    {
+        let cfg = self.cfg.clone();
+        async move {
+            // SOCKS5h onions are ephemeral (DiscardPK); the nickname hint is unused.
+            let listener = TorListener::bind(&cfg, params.virt_port).await?;
+            let addr = listener.onion_addr().clone();
+            Ok((listener, addr))
         }
     }
 }
@@ -368,5 +408,35 @@ mod tests {
             ..TorConfig::default()
         });
         fungi_transport::testkit::connect_use_drop_reconnect(connector, listener, &onion).await;
+    }
+
+    #[tokio::test]
+    async fn transport_roundtrips_through_fakes() {
+        use fungi_transport::{Connector, ListenParams, Transport};
+
+        let control = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control.local_addr().unwrap();
+        tokio::spawn(fake_control_once(control, "transportservice"));
+
+        let transport = TorTransport::new(TorConfig {
+            control_addr,
+            ..TorConfig::default()
+        });
+        let (mut listener, onion) = transport.listen(ListenParams::new(9735)).await.unwrap();
+        assert_eq!(onion.host(), "transportservice.onion");
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let local = std::net::SocketAddr::from(([127, 0, 0, 1], listener.local_port()));
+        tokio::spawn(fake_socks_forwarding(proxy, local));
+
+        let connector = TorTransport::new(TorConfig {
+            socks_addr: proxy_addr,
+            ..TorConfig::default()
+        })
+        .connector();
+        let (outbound, inbound) = tokio::join!(connector.connect(&onion), listener.accept());
+        fungi_transport::testkit::roundtrip_both_directions(outbound.unwrap(), inbound.unwrap())
+            .await;
     }
 }
